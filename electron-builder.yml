@@ -1,0 +1,36 @@
+appId: com.leadsender.app
+productName: LeadSender
+directories:
+  output: dist
+  buildResources: build
+files:
+  - dist-electron
+  - dist
+  - package.json
+asarUnpack:
+  - node_modules/better-sqlite3/**/*
+  - node_modules/whatsapp-web.js/**/*
+win:
+  target:
+    - nsis
+  icon: build/icon.ico
+  artifactName: ${productName}-Setup-${version}.${ext}
+  publisherName: LeadSender
+  verifyUpdateCodeSignature: false
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: LeadSender
+  installerIcon: build/icon.ico
+  uninstallerIcon: build/icon.ico
+  installerHeader: build/installerHeader.bmp
+  installerSidebar: build/installerSidebar.bmp
+  deleteAppDataOnUninstall: false
+publish:
+  provider: github
+  owner: yourusername
+  repo: leadsender
+  releaseType: release
