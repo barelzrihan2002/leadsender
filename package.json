@@ -6,7 +6,7 @@
   "main": "dist-electron/main.js",
   "repository": {
     "type": "git",
-    "url": "https://github.com/yourusername/leadsender.git"
+    "url": "https://github.com/barelzrihan2002/leadsender.git"
   },
   "scripts": {
     "dev": "vite",

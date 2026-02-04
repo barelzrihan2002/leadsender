@@ -31,6 +31,6 @@ nsis:
   deleteAppDataOnUninstall: false
 publish:
   provider: github
-  owner: yourusername
+  owner: barelzrihan2002
   repo: leadsender
   releaseType: release
