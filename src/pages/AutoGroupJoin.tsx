@@ -1,21 +1,29 @@
 import { useEffect, useMemo, useState } from 'react';
-import { ArrowRight, Check, Link2, Loader2, RefreshCcw, Users } from 'lucide-react';
+import { ArrowRight, Check, Link2, List, Loader2, RefreshCcw, Users } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
+import { Textarea } from '@/components/ui/textarea';
 import { Badge } from '@/components/ui/badge';
 import { toast } from '@/components/ui/use-toast';
 import { useLanguage } from '@/contexts/LanguageContext';
 import { api } from '@/lib/api';
+import { getRandomDelay } from '@/lib/utils';
 import type { Account, GroupJoinByInviteResult, GroupJoinByInviteStatus, WhatsAppGroupInviteInfo } from '@/types';
 
 type JoinRowStatus = GroupJoinByInviteStatus | 'joining';
+type JoinMode = 'single' | 'multiple';
 
 interface JoinResultRow extends Omit<GroupJoinByInviteResult, 'status'> {
   accountId: string;
   accountName: string;
   phoneNumber: string;
   status: JoinRowStatus;
+  groupLink?: string;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function getStatusClassName(status: JoinRowStatus): string {
@@ -86,10 +94,19 @@ export default function AutoGroupJoin() {
   const [loadingAccounts, setLoadingAccounts] = useState(true);
   const [loadingInviteInfo, setLoadingInviteInfo] = useState(false);
   const [joining, setJoining] = useState(false);
+  const [mode, setMode] = useState<JoinMode>('single');
+  const [groupLinksText, setGroupLinksText] = useState('');
+  const [minDelaySeconds, setMinDelaySeconds] = useState(15);
+  const [maxDelaySeconds, setMaxDelaySeconds] = useState(45);
 
   const selectedAccounts = useMemo(
     () => accounts.filter(account => selectedAccountIds.includes(account.id)),
     [accounts, selectedAccountIds]
+  );
+
+  const parsedGroupLinks = useMemo(
+    () => groupLinksText.split('\n').map(link => link.trim()).filter(Boolean),
+    [groupLinksText]
   );
 
   const previewAccountId = selectedAccountIds[0] || accounts[0]?.id || '';
@@ -162,8 +179,13 @@ export default function AutoGroupJoin() {
   }
 
   async function handleJoinSelectedAccounts() {
-    if (!inviteLink.trim()) {
-      toast.warning(language === 'he' ? 'הדבק קישור לקבוצה' : language === 'ar' ? 'ألصق رابط المجموعة' : 'Paste a group invite link');
+    if (mode === 'single') {
+      if (!inviteLink.trim()) {
+        toast.warning(language === 'he' ? 'הדבק קישור לקבוצה' : language === 'ar' ? 'ألصق رابط المجموعة' : 'Paste a group invite link');
+        return;
+      }
+    } else if (parsedGroupLinks.length === 0) {
+      toast.warning(language === 'he' ? 'הדבק לפחות קישור קבוצה אחד' : language === 'ar' ? 'ألصق رابط مجموعة واحدًا على الأقل' : 'Paste at least one group invite link');
       return;
     }
 
@@ -172,6 +194,14 @@ export default function AutoGroupJoin() {
       return;
     }
 
+    if (mode === 'single') {
+      await runSingleGroupJoin();
+    } else {
+      await runMultipleGroupsJoin();
+    }
+  }
+
+  async function runSingleGroupJoin() {
     setJoining(true);
     setResults(
       selectedAccounts.map(account => ({
@@ -216,6 +246,84 @@ export default function AutoGroupJoin() {
       }
     }
 
+    reportJoinSummary(completedRows);
+    setJoining(false);
+  }
+
+  async function runMultipleGroupsJoin() {
+    setJoining(true);
+
+    const initialRows: JoinResultRow[] = [];
+    for (const account of selectedAccounts) {
+      for (const groupLink of parsedGroupLinks) {
+        initialRows.push({
+          accountId: `${account.id}::${groupLink}`,
+          accountName: account.name || (language === 'he' ? 'ללא שם' : language === 'ar' ? 'بدون اسم' : 'Unnamed'),
+          phoneNumber: account.phone_number,
+          success: false,
+          status: 'joining',
+          message: language === 'he' ? 'בתור להצטרפות...' : language === 'ar' ? 'في قائمة الانتظار للانضمام...' : 'Queued to join...',
+          groupLink
+        });
+      }
+    }
+    setResults(initialRows);
+
+    const completedRows: JoinResultRow[] = [];
+    let isFirstAttempt = true;
+
+    for (const account of selectedAccounts) {
+      for (const groupLink of parsedGroupLinks) {
+        if (!isFirstAttempt) {
+          await sleep(getRandomDelay(minDelaySeconds, maxDelaySeconds) * 1000);
+        }
+        isFirstAttempt = false;
+
+        const rowId = `${account.id}::${groupLink}`;
+
+        setResults(prev => prev.map(row => row.accountId === rowId ? {
+          ...row,
+          status: 'joining',
+          message: language === 'he' ? 'מצטרף לקבוצה...' : language === 'ar' ? 'جارٍ الانضمام إلى المجموعة...' : 'Joining group...'
+        } : row));
+
+        try {
+          const result = await api.groups.joinGroupByInviteLink(account.id, groupLink);
+          const nextRow: JoinResultRow = {
+            accountId: rowId,
+            accountName: account.name || (language === 'he' ? 'ללא שם' : language === 'ar' ? 'بدون اسم' : 'Unnamed'),
+            phoneNumber: account.phone_number,
+            groupLink,
+            ...result
+          };
+
+          completedRows.push(nextRow);
+          setResults(prev => prev.map(row => row.accountId === rowId ? nextRow : row));
+        } catch (error) {
+          console.error(`Failed to join group ${groupLink} for account ${account.id}:`, error);
+          const failedRow: JoinResultRow = {
+            accountId: rowId,
+            accountName: account.name || (language === 'he' ? 'ללא שם' : language === 'ar' ? 'بدون اسم' : 'Unnamed'),
+            phoneNumber: account.phone_number,
+            success: false,
+            status: 'failed',
+            message: (error as Error).message || (language === 'he' ? 'ההצטרפות נכשלה' : language === 'ar' ? 'فشل الانضمام' : 'Join failed'),
+            groupId: null,
+            groupName: null,
+            groupLink
+          };
+
+          completedRows.push(failedRow);
+          setResults(prev => prev.map(row => row.accountId === rowId ? failedRow : row));
+        }
+      }
+    }
+
+    reportJoinSummary(completedRows);
+    setJoining(false);
+  }
+
+  function reportJoinSummary(completedRows: JoinResultRow[]) {
     const successCount = completedRows.filter(row => row.success).length;
     const pendingCount = completedRows.filter(row => row.status === 'pending_approval').length;
     const failedCount = completedRows.length - successCount - pendingCount;
@@ -223,10 +331,10 @@ export default function AutoGroupJoin() {
     if (failedCount === 0 && pendingCount === 0) {
       toast.success(
         language === 'he'
-          ? `${successCount} חשבונות סיימו להצטרף לקבוצה בהצלחה`
+          ? `${successCount} הצטרפויות הצליחו בהצלחה`
           : language === 'ar'
-          ? `تمت إضافة ${successCount} حسابات إلى المجموعة بنجاح`
-          : `${successCount} accounts joined the group successfully`
+          ? `تم إكمال ${successCount} عمليات انضمام بنجاح`
+          : `${successCount} joins completed successfully`
       );
     } else if (failedCount === 0 && pendingCount > 0) {
       toast.warning(
@@ -245,8 +353,6 @@ export default function AutoGroupJoin() {
           : `${successCount} succeeded, ${pendingCount} pending approval, ${failedCount} failed`
       );
     }
-
-    setJoining(false);
   }
 
   return (
@@ -264,49 +370,132 @@ export default function AutoGroupJoin() {
         </p>
       </div>
 
+      <div className="flex gap-2">
+        <Button
+          type="button"
+          variant={mode === 'single' ? 'default' : 'outline'}
+          onClick={() => { setMode('single'); setResults([]); }}
+          disabled={joining}
+          className="gap-2"
+        >
+          <Link2 className="h-4 w-4" />
+          {language === 'he' ? 'קבוצה אחת' : language === 'ar' ? 'مجموعة واحدة' : 'Single Group'}
+        </Button>
+        <Button
+          type="button"
+          variant={mode === 'multiple' ? 'default' : 'outline'}
+          onClick={() => { setMode('multiple'); setResults([]); }}
+          disabled={joining}
+          className="gap-2"
+        >
+          <List className="h-4 w-4" />
+          {language === 'he' ? 'רשימת קבוצות' : language === 'ar' ? 'قائمة مجموعات' : 'List of Groups'}
+        </Button>
+      </div>
+
       <div className="grid gap-6 xl:grid-cols-[1.15fr_0.85fr]">
         <Card className="border-none shadow-xl bg-card/50 backdrop-blur-sm">
           <div className="h-1.5 w-full bg-gradient-to-r from-blue-500 to-indigo-500"></div>
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
-              <Link2 className="h-5 w-5 text-blue-600" />
-              {language === 'he' ? 'קישור הזמנה לקבוצה' : language === 'ar' ? 'رابط دعوة المجموعة' : 'Group Invite Link'}
+              {mode === 'single' ? <Link2 className="h-5 w-5 text-blue-600" /> : <List className="h-5 w-5 text-blue-600" />}
+              {mode === 'single'
+                ? (language === 'he' ? 'קישור הזמנה לקבוצה' : language === 'ar' ? 'رابط دعوة المجموعة' : 'Group Invite Link')
+                : (language === 'he' ? 'רשימת קישורי הזמנה' : language === 'ar' ? 'قائمة روابط الدعوة' : 'Group Invite Links')}
             </CardTitle>
             <CardDescription>
-              {language === 'he'
-                ? 'תוכל להדביק לינק מלא של WhatsApp או רק את קוד ההזמנה.'
-                : language === 'ar'
-                ? 'يمكنك لصق رابط واتساب الكامل أو رمز الدعوة فقط.'
-                : 'You can paste the full WhatsApp link or just the invite code.'}
+              {mode === 'single'
+                ? (language === 'he'
+                  ? 'תוכל להדביק לינק מלא של WhatsApp או רק את קוד ההזמנה.'
+                  : language === 'ar'
+                  ? 'يمكنك لصق رابط واتساب الكامل أو رمز الدعوة فقط.'
+                  : 'You can paste the full WhatsApp link or just the invite code.')
+                : (language === 'he'
+                  ? 'הדבק קישור אחד בכל שורה. כל חשבון נבחר ינסה להצטרף לכל הקבוצות ברשימה, עם דיליי אקראי בין כל ניסיון.'
+                  : language === 'ar'
+                  ? 'ألصق رابطًا واحدًا في كل سطر. سيحاول كل حساب محدد الانضمام إلى جميع المجموعات في القائمة، مع تأخير عشوائي بين كل محاولة.'
+                  : 'Paste one link per line. Each selected account will try to join every group in the list, with a random delay between attempts.')}
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
-            <Input
-              value={inviteLink}
-              onChange={(event) => {
-                setInviteLink(event.target.value);
-                setInviteInfo(null);
-                setResults([]);
-              }}
-              placeholder="https://chat.whatsapp.com/..."
-            />
+            {mode === 'single' ? (
+              <Input
+                value={inviteLink}
+                onChange={(event) => {
+                  setInviteLink(event.target.value);
+                  setInviteInfo(null);
+                  setResults([]);
+                }}
+                placeholder="https://chat.whatsapp.com/..."
+              />
+            ) : (
+              <>
+                <Textarea
+                  value={groupLinksText}
+                  onChange={(event) => {
+                    setGroupLinksText(event.target.value);
+                    setResults([]);
+                  }}
+                  placeholder={"https://chat.whatsapp.com/AAA...\nhttps://chat.whatsapp.com/BBB...\nhttps://chat.whatsapp.com/CCC..."}
+                  className="min-h-[140px]"
+                />
+                <p className="text-sm text-muted-foreground">
+                  {language === 'he'
+                    ? `${parsedGroupLinks.length} קבוצות זוהו`
+                    : language === 'ar'
+                    ? `تم التعرف على ${parsedGroupLinks.length} مجموعات`
+                    : `${parsedGroupLinks.length} groups detected`}
+                </p>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="space-y-1.5">
+                    <label className="text-sm font-medium">
+                      {language === 'he' ? 'דיליי מינימלי (שניות)' : language === 'ar' ? 'أقل تأخير (ثوانٍ)' : 'Min delay (seconds)'}
+                    </label>
+                    <Input
+                      type="number"
+                      min={1}
+                      value={minDelaySeconds}
+                      onChange={(event) => setMinDelaySeconds(Math.max(1, Number(event.target.value) || 1))}
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <label className="text-sm font-medium">
+                      {language === 'he' ? 'דיליי מקסימלי (שניות)' : language === 'ar' ? 'أقصى تأخير (ثوانٍ)' : 'Max delay (seconds)'}
+                    </label>
+                    <Input
+                      type="number"
+                      min={1}
+                      value={maxDelaySeconds}
+                      onChange={(event) => setMaxDelaySeconds(Math.max(1, Number(event.target.value) || 1))}
+                    />
+                  </div>
+                </div>
+              </>
+            )}
 
             <div className="flex flex-col gap-3 sm:flex-row">
-              <Button onClick={handlePreviewInvite} disabled={loadingInviteInfo || joining || !inviteLink.trim()} variant="outline" className="gap-2 sm:flex-1">
-                {loadingInviteInfo ? (
-                  <>
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                    {language === 'he' ? 'בודק...' : language === 'ar' ? 'جارٍ الفحص...' : 'Checking...'}
-                  </>
-                ) : (
-                  <>
-                    <RefreshCcw className="h-4 w-4" />
-                    {language === 'he' ? 'בדוק קבוצה' : language === 'ar' ? 'فحص المجموعة' : 'Inspect Group'}
-                  </>
-                )}
-              </Button>
+              {mode === 'single' && (
+                <Button onClick={handlePreviewInvite} disabled={loadingInviteInfo || joining || !inviteLink.trim()} variant="outline" className="gap-2 sm:flex-1">
+                  {loadingInviteInfo ? (
+                    <>
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      {language === 'he' ? 'בודק...' : language === 'ar' ? 'جارٍ الفحص...' : 'Checking...'}
+                    </>
+                  ) : (
+                    <>
+                      <RefreshCcw className="h-4 w-4" />
+                      {language === 'he' ? 'בדוק קבוצה' : language === 'ar' ? 'فحص المجموعة' : 'Inspect Group'}
+                    </>
+                  )}
+                </Button>
+              )}
 
-              <Button onClick={handleJoinSelectedAccounts} disabled={joining || selectedAccounts.length === 0 || !inviteLink.trim()} className="gap-2 sm:flex-1">
+              <Button
+                onClick={handleJoinSelectedAccounts}
+                disabled={joining || selectedAccounts.length === 0 || (mode === 'single' ? !inviteLink.trim() : parsedGroupLinks.length === 0)}
+                className="gap-2 sm:flex-1"
+              >
                 {joining ? (
                   <>
                     <Loader2 className="h-4 w-4 animate-spin" />
@@ -314,11 +503,17 @@ export default function AutoGroupJoin() {
                   </>
                 ) : (
                   <>
-                    {language === 'he'
-                      ? `צרף ${selectedAccounts.length} חשבונות`
-                      : language === 'ar'
-                      ? `ضم ${selectedAccounts.length} حسابات`
-                      : `Join ${selectedAccounts.length} Accounts`}
+                    {mode === 'single'
+                      ? (language === 'he'
+                        ? `צרף ${selectedAccounts.length} חשבונות`
+                        : language === 'ar'
+                        ? `ضم ${selectedAccounts.length} حسابات`
+                        : `Join ${selectedAccounts.length} Accounts`)
+                      : (language === 'he'
+                        ? `צרף ${selectedAccounts.length} חשבונות ל-${parsedGroupLinks.length} קבוצות`
+                        : language === 'ar'
+                        ? `ضم ${selectedAccounts.length} حسابات إلى ${parsedGroupLinks.length} مجموعات`
+                        : `Join ${selectedAccounts.length} Accounts to ${parsedGroupLinks.length} Groups`)}
                     <ArrowRight className="h-4 w-4" />
                   </>
                 )}
@@ -334,7 +529,13 @@ export default function AutoGroupJoin() {
               {language === 'he' ? 'תצוגה מקדימה של הקבוצה' : language === 'ar' ? 'معاينة المجموعة' : 'Group Preview'}
             </CardTitle>
             <CardDescription>
-              {previewAccount
+              {mode === 'multiple'
+                ? (language === 'he'
+                  ? 'תצוגה מקדימה זמינה במצב "קבוצה אחת" בלבד.'
+                  : language === 'ar'
+                  ? 'المعاينة متوفرة فقط في وضع "مجموعة واحدة".'
+                  : 'Preview is only available in "Single Group" mode.')
+                : previewAccount
                 ? language === 'he'
                   ? `בדיקה דרך החשבון ${previewAccount.name || previewAccount.phone_number}`
                   : language === 'ar'
@@ -348,7 +549,7 @@ export default function AutoGroupJoin() {
             </CardDescription>
           </CardHeader>
           <CardContent>
-            {inviteInfo ? (
+            {mode === 'single' && inviteInfo ? (
               <div className="space-y-3">
                 <div className="flex items-start justify-between gap-3">
                   <div>
@@ -370,11 +571,17 @@ export default function AutoGroupJoin() {
               </div>
             ) : (
               <div className="rounded-xl border border-dashed p-6 text-sm text-muted-foreground text-center">
-                {language === 'he'
-                  ? 'עדיין לא נטענה תצוגה מקדימה. הדבק קישור ולחץ על "בדוק קבוצה".'
-                  : language === 'ar'
-                  ? 'لم يتم تحميل المعاينة بعد. ألصق الرابط واضغط "فحص المجموعة".'
-                  : 'No preview loaded yet. Paste the link and click "Inspect Group".'}
+                {mode === 'multiple'
+                  ? (language === 'he'
+                    ? `${parsedGroupLinks.length} קבוצות ברשימה, מוכנות להצטרפות.`
+                    : language === 'ar'
+                    ? `${parsedGroupLinks.length} مجموعات في القائمة، جاهزة للانضمام.`
+                    : `${parsedGroupLinks.length} groups queued, ready to join.`)
+                  : (language === 'he'
+                    ? 'עדיין לא נטענה תצוגה מקדימה. הדבק קישור ולחץ על "בדוק קבוצה".'
+                    : language === 'ar'
+                    ? 'لم يتم تحميل المعاينة بعد. ألصق الرابط واضغط "فحص المجموعة".'
+                    : 'No preview loaded yet. Paste the link and click "Inspect Group".')}
               </div>
             )}
           </CardContent>
@@ -473,7 +680,13 @@ export default function AutoGroupJoin() {
               {language === 'he' ? 'תוצאות ההצטרפות' : language === 'ar' ? 'نتائج الانضمام' : 'Join Results'}
             </CardTitle>
             <CardDescription>
-              {inviteInfo?.groupName || (language === 'he' ? 'קבוצת יעד' : language === 'ar' ? 'المجموعة المستهدفة' : 'Target Group')}
+              {mode === 'single'
+                ? (inviteInfo?.groupName || (language === 'he' ? 'קבוצת יעד' : language === 'ar' ? 'المجموعة المستهدفة' : 'Target Group'))
+                : (language === 'he'
+                  ? `${parsedGroupLinks.length} קבוצות · ${selectedAccounts.length} חשבונות`
+                  : language === 'ar'
+                  ? `${parsedGroupLinks.length} مجموعات · ${selectedAccounts.length} حسابات`
+                  : `${parsedGroupLinks.length} groups · ${selectedAccounts.length} accounts`)}
             </CardDescription>
           </CardHeader>
           <CardContent>
@@ -485,6 +698,11 @@ export default function AutoGroupJoin() {
                       <th className="text-left p-3 text-sm font-medium">
                         {language === 'he' ? 'חשבון' : language === 'ar' ? 'الحساب' : 'Account'}
                       </th>
+                      {mode === 'multiple' && (
+                        <th className="text-left p-3 text-sm font-medium">
+                          {language === 'he' ? 'קבוצה' : language === 'ar' ? 'المجموعة' : 'Group'}
+                        </th>
+                      )}
                       <th className="text-left p-3 text-sm font-medium">
                         {language === 'he' ? 'סטטוס' : language === 'ar' ? 'الحالة' : 'Status'}
                       </th>
@@ -502,6 +720,12 @@ export default function AutoGroupJoin() {
                             <p className="text-xs text-muted-foreground font-mono">{result.phoneNumber}</p>
                           </div>
                         </td>
+                        {mode === 'multiple' && (
+                          <td className="p-3">
+                            <p className="text-sm font-medium">{result.groupName || (language === 'he' ? 'לא ידוע' : language === 'ar' ? 'غير معروف' : 'Unknown')}</p>
+                            <p className="text-xs text-muted-foreground break-all">{result.groupLink}</p>
+                          </td>
+                        )}
                         <td className="p-3">
                           <Badge variant="secondary" className={getStatusClassName(result.status)}>
                             {getStatusLabel(language, result.status)}

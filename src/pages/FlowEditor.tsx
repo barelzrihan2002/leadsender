@@ -17,7 +17,7 @@ import 'reactflow/dist/style.css';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Card } from '@/components/ui/card';
-import { Save, ArrowLeft, Copy, Trash2, Search, Equal, MessageSquare, Clock, Shuffle, MessageCircle, Check, Webhook, Send } from 'lucide-react';
+import { Save, ArrowLeft, Copy, Trash2, Search, Equal, MessageSquare, Clock, Shuffle, MessageCircle, Check, Webhook, Send, Ban } from 'lucide-react';
 import { useLanguage } from '@/contexts/LanguageContext';
 import { toast } from '@/components/ui/use-toast';
 import type { Account } from '@/types';
@@ -25,16 +25,19 @@ import type { Account } from '@/types';
 // Custom nodes
 import ConditionContainsNode from '@/components/flows/ConditionContainsNode';
 import ConditionEqualsNode from '@/components/flows/ConditionEqualsNode';
+import ConditionLastMessageAgeNode from '@/components/flows/ConditionLastMessageAgeNode';
 import ActionSendNode from '@/components/flows/ActionSendNode';
 import ActionAutoReplyNode from '@/components/flows/ActionAutoReplyNode';
 import ActionDelayNode from '@/components/flows/ActionDelayNode';
 import ActionTypingNode from '@/components/flows/ActionTypingNode';
 import ActionForwardMessageNode from '@/components/flows/ActionForwardMessageNode';
 import ActionWebhookNode from '@/components/flows/ActionWebhookNode';
+import ActionBlacklistNode from '@/components/flows/ActionBlacklistNode';
 
 const nodeTypes = {
   conditionContains: ConditionContainsNode,
   conditionEquals: ConditionEqualsNode,
+  conditionLastMessageAge: ConditionLastMessageAgeNode,
   actionSend: ActionSendNode,
   actionAutoReply: ActionAutoReplyNode,
   actionDelay: ActionDelayNode,
@@ -42,6 +45,7 @@ const nodeTypes = {
   actionTyping: ActionTypingNode,
   actionForwardMessage: ActionForwardMessageNode,
   actionWebhook: ActionWebhookNode,
+  actionBlacklist: ActionBlacklistNode,
 };
 
 let nodeIdCounter = 0;
@@ -408,6 +412,15 @@ export default function FlowEditor() {
                 gradientTo="#3b82f6"
                 description={language === 'he' ? 'בדוק אם ההודעה שווה בדיוק' : language === 'ar' ? 'تحقق من مطابقة الرسالة بالضبط' : 'Check exact text match'}
               />
+
+              <PaletteItem 
+                type="conditionLastMessageAge" 
+                label={t('flows.ifLastMessageOlderThan')} 
+                icon={Clock} 
+                gradientFrom="#0ea5e9"
+                gradientTo="#2563eb"
+                description={language === 'he' ? 'בדוק אם ההודעה האחרונה בצאט ישנה מיותר מ-X שעות' : language === 'ar' ? 'تحقق مما إذا كانت آخر رسالة في المحادثة أقدم من X ساعات' : 'Check if the last message in the chat is older than X hours'}
+              />
             </div>
 
             {/* Actions Section */}
@@ -480,6 +493,15 @@ export default function FlowEditor() {
                 gradientTo="#f43f5e"
                 description={language === 'he' ? 'שלח webhook לכתובת חיצונית' : language === 'ar' ? 'إرسال webhook إلى عنوان خارجي' : 'Send webhook to external URL'}
               />
+
+              <PaletteItem 
+                type="actionBlacklist" 
+                label={t('flows.blacklist')} 
+                icon={Ban} 
+                gradientFrom="#dc2626"
+                gradientTo="#b91c1c"
+                description={t('flows.blacklistDescription')}
+              />
             </div>
           </div>
 
@@ -524,6 +546,7 @@ export default function FlowEditor() {
                 if (n.type?.includes('Delay')) return '#f59e0b';
                 if (n.type?.includes('Typing')) return '#a855f7';
                 if (n.type?.includes('Webhook')) return '#e11d48';
+                if (n.type?.includes('Blacklist')) return '#dc2626';
                 return '#6366f1';
               }}
               maskColor="rgb(248, 250, 252, 0.8)"

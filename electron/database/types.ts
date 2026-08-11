@@ -10,6 +10,7 @@ export interface AccountRow {
   session_path?: string;
   qr_code?: string;
   last_seen?: string;
+  duoplus_device_id?: string;
   created_at: string;
 }
 
@@ -23,6 +24,7 @@ export interface CampaignRow {
   max_messages_per_day: number;
   start_hour: number;
   end_hour: number;
+  send_mode?: 'web' | 'cloud_phone';
   created_at: string;
   started_at?: string;
   completed_at?: string;

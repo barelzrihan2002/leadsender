@@ -50,6 +50,7 @@ export default function CreateCampaignPage() {
   const [loading, setLoading] = useState(false);
   const [loadingCampaign, setLoadingCampaign] = useState(isEditMode);
   const [accounts, setAccounts] = useState<Account[]>([]);
+  const [duoplusAccounts, setDuoplusAccounts] = useState<Account[]>([]);
   const [tags, setTags] = useState<Tag[]>([]);
   const [selectedAccounts, setSelectedAccounts] = useState<string[]>([]);
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
@@ -171,8 +172,25 @@ export default function CreateCampaignPage() {
     break_duration: null as number | null,
     enable_breaks: false,
     skip_recent_contacts: false,
-    skip_recent_days: 7
+    skip_recent_days: 7,
+    send_mode: 'web' as 'web' | 'cloud_phone'
   });
+
+  // Extra message variants (besides formData.message which is variant #1).
+  // At send time the scheduler picks one variant at random for each contact.
+  const [messageVariants, setMessageVariants] = useState<string[]>([]);
+
+  const addMessageVariant = () => {
+    setMessageVariants(prev => [...prev, '']);
+  };
+
+  const updateMessageVariant = (index: number, value: string) => {
+    setMessageVariants(prev => prev.map((variant, i) => (i === index ? value : variant)));
+  };
+
+  const removeMessageVariant = (index: number) => {
+    setMessageVariants(prev => prev.filter((_, i) => i !== index));
+  };
 
   // Test message state
   const [testPhoneNumber, setTestPhoneNumber] = useState('');
@@ -223,8 +241,12 @@ export default function CreateCampaignPage() {
         break_duration: campaign.break_duration || null,
         enable_breaks: !!(campaign.messages_before_break && campaign.break_duration),
         skip_recent_contacts: campaign.skip_recent_contacts || false,
-        skip_recent_days: campaign.skip_recent_days || 7
+        skip_recent_days: campaign.skip_recent_days || 7,
+        send_mode: campaign.send_mode === 'cloud_phone' ? 'cloud_phone' : 'web'
       });
+
+      // Load extra message variants (variant #1 is formData.message above)
+      setMessageVariants(campaign.message_variants || []);
       
       // Load media if exists
       if (campaign.media_path) {
@@ -277,6 +299,8 @@ export default function CreateCampaignPage() {
   const loadAccounts = async () => {
     const data = await api.accounts.getAll();
     setAccounts(data.filter(acc => acc.status === 'connected'));
+    // Cloud-phone sending doesn't require an active WhatsApp Web session - just a linked DuoPlus device
+    setDuoplusAccounts(data.filter(acc => !!acc.duoplus_device_id));
   };
 
   const loadTags = async () => {
@@ -315,11 +339,23 @@ export default function CreateCampaignPage() {
     setMediaType(null);
   };
 
+  // Accounts eligible for the currently selected send mode
+  const sendableAccounts = formData.send_mode === 'cloud_phone' ? duoplusAccounts : accounts;
+
   const toggleSelectAllAccounts = () => {
-    if (selectedAccounts.length === accounts.length) {
+    if (selectedAccounts.length === sendableAccounts.length) {
       setSelectedAccounts([]);
     } else {
-      setSelectedAccounts(accounts.map(acc => acc.id));
+      setSelectedAccounts(sendableAccounts.map(acc => acc.id));
+    }
+  };
+
+  const handleSendModeChange = (mode: 'web' | 'cloud_phone') => {
+    setFormData(prev => ({ ...prev, send_mode: mode }));
+    // Accounts eligible differ per mode - clear selection to avoid mismatched accounts being submitted
+    setSelectedAccounts([]);
+    if (mode === 'cloud_phone') {
+      removeMedia();
     }
   };
 
@@ -434,13 +470,20 @@ export default function CreateCampaignPage() {
       
       // Convert skip_recent_contacts to 0/1 for SQLite
       campaignData.skip_recent_contacts = formData.skip_recent_contacts ? 1 : 0;
+
+      // Extra message variants (variant #1 is campaignData.message above)
+      campaignData.message_variants = messageVariants.filter(variant => variant.trim().length > 0);
       
       // Remove enable_scheduling and enable_breaks from data (not DB fields)
       delete campaignData.enable_scheduling;
       delete campaignData.enable_breaks;
       
-      // If there's a new media file, save it
-      if (mediaFile) {
+      // Cloud-phone send mode only supports text - never persist media for it
+      if (formData.send_mode === 'cloud_phone') {
+        campaignData.media_path = null;
+        campaignData.media_type = null;
+        campaignData.media_caption = null;
+      } else if (mediaFile) {
         console.log('💾 Saving campaign media:', mediaFile.name);
         const arrayBuffer = await mediaFile.arrayBuffer();
         const buffer = new Uint8Array(arrayBuffer);
@@ -957,13 +1000,14 @@ export default function CreateCampaignPage() {
                               )}
                             </div>
                             
-                            <Button 
+                            {formData.send_mode !== 'cloud_phone' && (
+                              <Button 
                                 type="button" 
                                 variant="outline"
                                 size="sm" 
                                 className="h-9 px-4 rounded-full border-dashed border-primary/30 hover:border-primary hover:bg-primary/5 text-primary gap-2 shadow-sm hover:shadow-md transition-all font-medium"
                                 onClick={() => document.getElementById('media-upload')?.click()}
-                            >
+                              >
                                 <Upload className="h-4 w-4" />
                                 <span className="text-xs hidden sm:inline">
                                   {mediaFile 
@@ -971,10 +1015,17 @@ export default function CreateCampaignPage() {
                                     : (language === 'he' ? 'צרף קובץ' : language === 'ar' ? 'إرفاق ملف' : 'Attach File')
                                   }
                                 </span>
-                            </Button>
+                              </Button>
+                            )}
                         </div>
                     </div>
-                    {mediaFile && (
+                    {formData.send_mode === 'cloud_phone' && (
+                        <p className="text-xs text-muted-foreground flex items-center gap-1.5">
+                            <Info className="h-3.5 w-3.5" />
+                            {language === 'he' ? 'שליחה בטלפון ענן תומכת בטקסט בלבד - מדיה לא תישלח.' : language === 'ar' ? 'الإرسال عبر الهاتف السحابي يدعم النص فقط - لن يتم إرسال الوسائط.' : 'Cloud phone sending only supports text - media will not be sent.'}
+                        </p>
+                    )}
+                    {mediaFile && formData.send_mode !== 'cloud_phone' && (
                         <div className="flex items-center gap-4 p-4 border border-primary/20 rounded-xl bg-primary/5 animate-in fade-in slide-in-from-bottom-2">
                             <div className="h-12 w-12 rounded-lg bg-background flex items-center justify-center shadow-sm">
                               {mediaType === 'image' ? <ImageIcon className="h-6 w-6 text-blue-500" /> : 
@@ -990,6 +1041,53 @@ export default function CreateCampaignPage() {
                             </Button>
                         </div>
                     )}
+
+                    {/* Message Variants (random selection at send time) */}
+                    <div className="space-y-3 pt-2">
+                      <div className="flex items-center justify-between">
+                        <Label className="text-sm font-medium flex items-center gap-2 text-muted-foreground">
+                          {t('createCampaign.step1.messageVariantsTitle')}
+                        </Label>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={addMessageVariant}
+                          className="text-xs font-normal h-7"
+                        >
+                          {t('createCampaign.step1.addMessageVariant')}
+                        </Button>
+                      </div>
+
+                      {messageVariants.length > 0 && (
+                        <p className="text-xs text-muted-foreground">
+                          {t('createCampaign.step1.messageVariantsHint')}
+                        </p>
+                      )}
+
+                      {messageVariants.map((variant, index) => (
+                        <div key={index} className="relative">
+                          <div className="text-[11px] font-medium text-muted-foreground mb-1">
+                            {t('createCampaign.step1.messageVariantLabel')} {index + 2}
+                          </div>
+                          <Textarea
+                            value={variant}
+                            onChange={(e) => updateMessageVariant(index, e.target.value)}
+                            placeholder={t('createCampaign.step1.messagePlaceholder')}
+                            className="min-h-[100px] resize-none pr-10 leading-relaxed text-base border-primary/20 focus:border-primary focus:ring-primary/20 bg-background/50 transition-all"
+                          />
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon"
+                            onClick={() => removeMessageVariant(index)}
+                            className="absolute top-6 right-2 h-7 w-7 text-muted-foreground hover:text-destructive hover:bg-destructive/10 rounded-full transition-colors"
+                          >
+                            <X className="h-3.5 w-3.5" />
+                          </Button>
+                        </div>
+                      ))}
+                    </div>
                   </div>
                 </CardContent>
               </Card>
@@ -1007,6 +1105,56 @@ export default function CreateCampaignPage() {
                   </div>
                 </CardHeader>
                 <CardContent className="space-y-8 pl-6 pr-6 pb-8">
+                   {/* Send Mode Selection */}
+                   <div className="space-y-3">
+                        <Label className="text-base font-medium">
+                          {language === 'he' ? 'אופן שליחה' : language === 'ar' ? 'طريقة الإرسال' : 'Send Mode'}
+                        </Label>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                            <button
+                                type="button"
+                                onClick={() => handleSendModeChange('web')}
+                                className={cn(
+                                    "text-left p-4 rounded-xl border-2 transition-all",
+                                    formData.send_mode === 'web'
+                                        ? "border-primary bg-primary/5 ring-1 ring-primary shadow-sm"
+                                        : "border-border/50 hover:border-primary/30 bg-background/50"
+                                )}
+                            >
+                                <p className="font-semibold text-sm">{language === 'he' ? 'WhatsApp Web' : language === 'ar' ? 'واتساب ويب' : 'WhatsApp Web'}</p>
+                                <p className="text-xs text-muted-foreground mt-1">{language === 'he' ? 'שולח דרך חיבור ה-WhatsApp Web הקיים. תומך בטקסט ומדיה.' : language === 'ar' ? 'يرسل عبر اتصال واتساب ويب الحالي. يدعم النص والوسائط.' : 'Sends through the existing WhatsApp Web session. Supports text and media.'}</p>
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => handleSendModeChange('cloud_phone')}
+                                className={cn(
+                                    "text-left p-4 rounded-xl border-2 transition-all",
+                                    formData.send_mode === 'cloud_phone'
+                                        ? "border-primary bg-primary/5 ring-1 ring-primary shadow-sm"
+                                        : "border-border/50 hover:border-primary/30 bg-background/50"
+                                )}
+                            >
+                                <p className="font-semibold text-sm">{language === 'he' ? 'טלפון ענן (DuoPlus)' : language === 'ar' ? 'هاتف سحابي (DuoPlus)' : 'Cloud Phone (DuoPlus)'}</p>
+                                <p className="text-xs text-muted-foreground mt-1">{language === 'he' ? 'שולח דרך אפליקציית WhatsApp במכשיר ענן. טקסט בלבד, ללא מדיה.' : language === 'ar' ? 'يرسل عبر تطبيق واتساب على هاتف سحابي. نص فقط، بدون وسائط.' : 'Sends through the WhatsApp app on a cloud phone device. Text only, no media.'}</p>
+                            </button>
+                        </div>
+                        {formData.send_mode === 'cloud_phone' && duoplusAccounts.length === 0 && (
+                            <div className="bg-amber-50 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-800 rounded-lg p-3">
+                                <p className="text-xs text-amber-900 dark:text-amber-100 flex items-center gap-2">
+                                    <Info className="h-3.5 w-3.5 flex-shrink-0" />
+                                    {language === 'he'
+                                        ? 'אין חשבונות עם מזהה מכשיר DuoPlus. הגדר מזהה מכשיר לחשבון בעמוד החשבונות.'
+                                        : language === 'ar'
+                                        ? 'لا توجد حسابات مرتبطة بمعرف جهاز DuoPlus. قم بتعيين معرف الجهاز للحساب في صفحة الحسابات.'
+                                        : 'No accounts have a DuoPlus device ID assigned. Set a device ID for an account on the Accounts page.'
+                                    }
+                                </p>
+                            </div>
+                        )}
+                   </div>
+
+                   <Separator className="bg-border/50" />
+
                    {/* Accounts Selection */}
                    <div className="space-y-4">
                         <div className="flex items-center justify-between">
@@ -1015,12 +1163,12 @@ export default function CreateCampaignPage() {
                               {t('createCampaign.step2.sendFromAccounts')}
                             </Label>
                             <Button variant="ghost" size="sm" onClick={toggleSelectAllAccounts} className="h-8 text-xs gap-2 hover:bg-primary/10 hover:text-primary">
-                                {selectedAccounts.length === accounts.length ? <CheckSquare className="h-4 w-4"/> : <Square className="h-4 w-4"/>}
-                                {selectedAccounts.length === accounts.length ? t('createCampaign.step2.deselectAll') : t('createCampaign.step2.selectAll')}
+                                {selectedAccounts.length === sendableAccounts.length ? <CheckSquare className="h-4 w-4"/> : <Square className="h-4 w-4"/>}
+                                {selectedAccounts.length === sendableAccounts.length ? t('createCampaign.step2.deselectAll') : t('createCampaign.step2.selectAll')}
                             </Button>
                         </div>
                         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                            {accounts.map(account => (
+                            {sendableAccounts.map(account => (
                                 <div
                                     key={account.id}
                                     onClick={() => toggleAccount(account.id)}
@@ -1460,7 +1608,8 @@ export default function CreateCampaignPage() {
                     </CardContent>
                 </Card>
 
-                {/* Test Message Card */}
+                {/* Test Message Card - only applicable to WhatsApp Web send mode */}
+                {formData.send_mode !== 'cloud_phone' && (
                 <Card className="border-none shadow-xl bg-card/80 backdrop-blur overflow-hidden">
                     <div className="h-1 w-full bg-gradient-to-r from-green-500 to-emerald-500"></div>
                     <CardHeader className="pb-3">
@@ -1552,6 +1701,7 @@ export default function CreateCampaignPage() {
                         )}
                     </CardContent>
                 </Card>
+                )}
               </div>
             </div>
 

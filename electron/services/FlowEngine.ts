@@ -48,7 +48,7 @@ export class FlowEngine {
   /**
    * בדוק אם יש Flow פעיל עבור account זה והפעל אותו
    */
-  async checkAndExecuteFlow(accountId: string, chatId: string, incomingMessage: any): Promise<boolean> {
+  async checkAndExecuteFlow(accountId: string, chatId: string, incomingMessage: any, softwareChatId?: string): Promise<boolean> {
     try {
       // Generate unique key for this message in this chat
       const messageKey = `${accountId}:${chatId}:${incomingMessage.id?.id || incomingMessage.timestamp}`;
@@ -78,13 +78,13 @@ export class FlowEngine {
       
       // 2. עבור על כל Flow ובדוק תנאים
       for (const flow of activeFlows) {
-        const shouldExecute = await this.evaluateFlowConditions(flow, incomingMessage);
+        const shouldExecute = await this.evaluateFlowConditions(flow, accountId, chatId, incomingMessage, softwareChatId);
         
         if (shouldExecute) {
           console.log(`🤖 Flow "${flow.name}" conditions matched - executing...`);
           
           // 3. הפעל את הFlow
-          await this.executeFlow(flow, accountId, chatId, incomingMessage);
+          await this.executeFlow(flow, accountId, chatId, incomingMessage, softwareChatId);
           return true; // Flow executed
         }
       }
@@ -125,7 +125,7 @@ export class FlowEngine {
   /**
    * בדוק אם Flow צריך להתבצע (בדוק את התנאי הראשון)
    */
-  private async evaluateFlowConditions(flow: Flow, message: any): Promise<boolean> {
+  private async evaluateFlowConditions(flow: Flow, accountId: string, chatId: string, message: any, softwareChatId?: string): Promise<boolean> {
     // מצא את הצומת הראשון (שאין לו target handle - אין edge שמגיע אליו)
     const nodesStmt = this.db.prepare('SELECT * FROM flow_nodes WHERE flow_id = ?');
     const nodes = nodesStmt.all(flow.id) as FlowNode[];
@@ -155,15 +155,72 @@ export class FlowEngine {
         return messageText.toLowerCase() === (data.text || '').toLowerCase();
       }
     }
+
+    if (startNode.type === 'conditionLastMessageAge' || startNode.type === 'condition_last_message_age') {
+      // Always execute the flow - YES/NO branching happens inside executeNode
+      return true;
+    }
     
     // אם הצומת הראשון הוא action - תמיד הפעל
     return true;
   }
 
   /**
+   * בודק אם ההודעה שלפני ההודעה הנוכחית (זו שהפעילה את הFlow) ישנה מיותר מ-X שעות/דקות.
+   * משתמש בטבלת messages עם OFFSET 1 כדי לדלג על ההודעה הנוכחית.
+   * אם אין הודעה קודמת - מחזיר true ("מזמן לא הייתה הודעה").
+   */
+  private isLastMessageOlderThan(accountId: string, chatId: string, value: number, unit: string, softwareChatId?: string): boolean {
+    // Use softwareChatId directly if available (passed from WhatsAppManager)
+    // Otherwise fall back to phone number lookup
+    let resolvedChatId = softwareChatId;
+
+    if (!resolvedChatId) {
+      const digits = this.extractDigits(chatId);
+      if (!digits) {
+        return true;
+      }
+      const chatStmt = this.db.prepare(`
+        SELECT id FROM chats
+        WHERE account_id = ?
+          AND (phone_number = ? OR phone_number LIKE ?)
+        ORDER BY last_message_at DESC
+        LIMIT 1
+      `);
+      const chat = chatStmt.get(accountId, digits, `%${digits.slice(-9)}`) as { id?: string } | undefined;
+      if (!chat?.id) {
+        return true;
+      }
+      resolvedChatId = chat.id;
+    }
+
+    // Get the second-to-last message (the one BEFORE the current incoming message)
+    const msgStmt = this.db.prepare(`
+      SELECT timestamp FROM messages
+      WHERE software_chat_id = ?
+      ORDER BY timestamp DESC
+      LIMIT 1 OFFSET 1
+    `);
+    const prevMsg = msgStmt.get(resolvedChatId) as { timestamp?: string } | undefined;
+
+    if (!prevMsg?.timestamp) {
+      return true;
+    }
+
+    const lastMessageTime = new Date(prevMsg.timestamp).getTime();
+    if (Number.isNaN(lastMessageTime)) {
+      return true;
+    }
+
+    const divisor = unit === 'minutes' ? 1000 * 60 : 1000 * 60 * 60;
+    const elapsed = (Date.now() - lastMessageTime) / divisor;
+    return elapsed > value;
+  }
+
+  /**
    * הפעל Flow מלא
    */
-  private async executeFlow(flow: Flow, accountId: string, chatId: string, triggerMessage: any): Promise<void> {
+  private async executeFlow(flow: Flow, accountId: string, chatId: string, triggerMessage: any, softwareChatId?: string): Promise<void> {
     const executionId = uuidv4();
     
     // רשום התחלת ביצוע
@@ -195,7 +252,7 @@ export class FlowEngine {
       
       while (currentNode && stepCount < maxSteps) {
         console.log(`🤖 Executing node: ${currentNode.type}`);
-        currentNode = await this.executeNode(currentNode, accountId, chatId, triggerMessage);
+        currentNode = await this.executeNode(currentNode, accountId, chatId, triggerMessage, softwareChatId);
         stepCount++;
       }
       
@@ -281,7 +338,7 @@ export class FlowEngine {
   /**
    * בצע צומת בודד
    */
-  private async executeNode(node: ExecutionNode, accountId: string, chatId: string, message: any): Promise<ExecutionNode | null> {
+  private async executeNode(node: ExecutionNode, accountId: string, chatId: string, message: any, softwareChatId?: string): Promise<ExecutionNode | null> {
     switch (node.type) {
       case 'conditionContains':
       case 'condition_contains': {
@@ -297,6 +354,15 @@ export class FlowEngine {
         const equals = messageText.toLowerCase() === (node.data.text || '').toLowerCase();
         console.log(`🔍 Condition "equals ${node.data.text}": ${equals ? 'YES' : 'NO'}`);
         return equals ? node.edgeYes || null : node.edgeNo || null;
+      }
+
+      case 'conditionLastMessageAge':
+      case 'condition_last_message_age': {
+        const value = Number(node.data.hours) || 0;
+        const unit = node.data.unit || 'hours';
+        const older = this.isLastMessageOlderThan(accountId, chatId, value, unit, softwareChatId);
+        console.log(`🔍 Condition "last message older than ${value}${unit === 'minutes' ? 'm' : 'h'}": ${older ? 'YES' : 'NO'}`);
+        return older ? node.edgeYes || null : node.edgeNo || null;
       }
       
       case 'actionSend':
@@ -393,7 +459,15 @@ export class FlowEngine {
         await this.executeWebhook(node.data, accountId, chatId, message);
         return node.nextNode || null;
       }
-      
+
+      case 'actionBlacklist':
+      case 'action_blacklist': {
+        const messageContext = await this.getMessageContext(accountId, chatId, message);
+        console.log(`🚫 Adding contact ${messageContext.senderPhone} to BlackList`);
+        await this.addContactToBlacklist(messageContext.senderPhone, messageContext.senderName);
+        return node.nextNode || null;
+      }
+
       default:
         console.log(`⚠️ Unknown node type: ${node.type}`);
         return null;
@@ -559,5 +633,59 @@ export class FlowEngine {
    */
   private sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  /**
+   * הוסף איש קשר לרשימה השחורה (BlackList) לפי מספר טלפון.
+   * יוצר את איש הקשר אם עדיין לא קיים בטבלת ה-contacts.
+   */
+  private async addContactToBlacklist(phoneNumber: string, name?: string): Promise<void> {
+    const digits = this.extractDigits(phoneNumber);
+    if (!digits) {
+      console.log('⚠️ actionBlacklist skipped - no phone number resolved for this contact');
+      return;
+    }
+
+    try {
+      // Find existing contact by matching normalized phone number formats
+      const findStmt = this.db.prepare(`
+        SELECT id FROM contacts
+        WHERE REPLACE(REPLACE(REPLACE(phone_number, '-', ''), ' ', ''), '+', '') = ?
+           OR REPLACE(REPLACE(REPLACE(phone_number, '-', ''), ' ', ''), '+', '') LIKE ?
+      `);
+      let contact = findStmt.get(digits, `%${digits.slice(-9)}`) as { id: string } | undefined;
+
+      if (!contact) {
+        const newContactId = uuidv4();
+        const insertContactStmt = this.db.prepare(`
+          INSERT OR IGNORE INTO contacts (id, phone_number, name)
+          VALUES (?, ?, ?)
+        `);
+        insertContactStmt.run(newContactId, digits, name || null);
+        contact = { id: newContactId };
+      }
+
+      // Ensure the system BlackList tag exists (should already, created on DB init)
+      const tagStmt = this.db.prepare(`SELECT id FROM tags WHERE name = 'BlackList'`);
+      let tag = tagStmt.get() as { id: string } | undefined;
+
+      if (!tag) {
+        const newTagId = uuidv4();
+        this.db.prepare(`
+          INSERT INTO tags (id, name, color, is_system)
+          VALUES (?, 'BlackList', '#000000', 1)
+        `).run(newTagId);
+        tag = { id: newTagId };
+      }
+
+      this.db.prepare(`
+        INSERT OR IGNORE INTO contact_tags (contact_id, tag_id)
+        VALUES (?, ?)
+      `).run(contact.id, tag.id);
+
+      console.log(`✅ Contact ${digits} added to BlackList`);
+    } catch (error) {
+      console.error('❌ Error adding contact to BlackList:', error);
+    }
   }
 }

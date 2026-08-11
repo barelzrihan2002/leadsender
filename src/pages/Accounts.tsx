@@ -21,7 +21,7 @@ export default function Accounts() {
   const [selectedAccountIds, setSelectedAccountIds] = useState<Set<string>>(new Set());
   const [showBulkUpdateDialog, setShowBulkUpdateDialog] = useState(false);
   const [bulkUpdateName, setBulkUpdateName] = useState('');
-  const [bulkUpdateImage, setBulkUpdateImage] = useState<File | null>(null);
+  const [bulkUpdateImages, setBulkUpdateImages] = useState<File[]>([]);
   const [refreshingPictures, setRefreshingPictures] = useState(false);
   const [deleteDialog, setDeleteDialog] = useState<{
     open: boolean;
@@ -186,7 +186,7 @@ export default function Accounts() {
   };
 
   const executeBulkUpdate = async () => {
-    if (!bulkUpdateName && !bulkUpdateImage) {
+    if (!bulkUpdateName && bulkUpdateImages.length === 0) {
       toast.warning(t('accounts.enterNameOrImage'));
       return;
     }
@@ -195,16 +195,21 @@ export default function Accounts() {
     let succeeded = 0;
     const failedAccounts: { id: string; error: string }[] = [];
 
-    // Pre-save the image temp file once (reused for all accounts)
-    let tempFilePath: string | null = null;
-    if (bulkUpdateImage) {
+    // Pre-save all image temp files once (reused/randomly picked for all accounts)
+    const tempFilePaths: string[] = [];
+    if (bulkUpdateImages.length > 0) {
       try {
-        const arrayBuffer = await bulkUpdateImage.arrayBuffer();
-        const buffer = new Uint8Array(arrayBuffer);
-        tempFilePath = await api.messages.saveTempFile(bulkUpdateImage.name, buffer as any);
+        for (const image of bulkUpdateImages) {
+          const arrayBuffer = await image.arrayBuffer();
+          const buffer = new Uint8Array(arrayBuffer);
+          const tempFilePath = await api.messages.saveTempFile(image.name, buffer as any);
+          tempFilePaths.push(tempFilePath);
+        }
       } catch (error: any) {
-        console.error('Failed to save temp image:', error);
-        toast.error('Failed to prepare image');
+        console.error('Failed to save temp image(s):', error);
+        toast.error('Failed to prepare image(s)');
+        // Clean up any temp files that were already saved before the failure
+        await Promise.all(tempFilePaths.map(p => api.messages.deleteTempFile(p).catch(() => {})));
         return;
       }
     }
@@ -220,8 +225,10 @@ export default function Accounts() {
             await api.accounts.updateWhatsAppName(accountId, bulkUpdateName.trim());
           }
 
-          if (tempFilePath) {
-            await api.accounts.updateWhatsAppImage(accountId, tempFilePath);
+          if (tempFilePaths.length > 0) {
+            // Pick a random image from the uploaded set for this account
+            const randomPath = tempFilePaths[Math.floor(Math.random() * tempFilePaths.length)];
+            await api.accounts.updateWhatsAppImage(accountId, randomPath);
           }
 
           succeeded++;
@@ -236,13 +243,15 @@ export default function Accounts() {
       }));
     }
 
-    // Clean up temp image file once after all updates complete
-    if (tempFilePath) {
-      try {
-        await api.messages.deleteTempFile(tempFilePath);
-      } catch (e) {
-        console.warn('Failed to delete temp file:', e);
-      }
+    // Clean up temp image files once after all updates complete
+    if (tempFilePaths.length > 0) {
+      await Promise.all(tempFilePaths.map(async (p) => {
+        try {
+          await api.messages.deleteTempFile(p);
+        } catch (e) {
+          console.warn('Failed to delete temp file:', e);
+        }
+      }));
     }
 
     // Show summary toast
@@ -258,7 +267,7 @@ export default function Accounts() {
 
     setShowBulkUpdateDialog(false);
     setBulkUpdateName('');
-    setBulkUpdateImage(null);
+    setBulkUpdateImages([]);
     setSelectionMode(false);
     setSelectedAccountIds(new Set());
   };
@@ -440,6 +449,7 @@ export default function Accounts() {
               selectionMode={selectionMode}
               isSelected={selectedAccountIds.has(account.id)}
               onSelect={(selected) => toggleAccountSelection(account.id, selected)}
+              onUpdated={loadAccounts}
             />
           ))}
         </div>
@@ -475,15 +485,40 @@ export default function Accounts() {
                 <Input
                   type="file"
                   accept="image/*"
-                  onChange={(e) => setBulkUpdateImage(e.target.files?.[0] || null)}
+                  multiple
+                  onChange={(e) => {
+                    const newFiles = Array.from(e.target.files || []);
+                    if (newFiles.length > 0) {
+                      setBulkUpdateImages(prev => [...prev, ...newFiles]);
+                    }
+                    e.target.value = '';
+                  }}
                   className="cursor-pointer"
                 />
               </div>
-              {bulkUpdateImage && (
-                <p className="text-xs text-green-600 flex items-center gap-1">
-                  <Image className="h-3 w-3" />
-                  {bulkUpdateImage.name}
-                </p>
+              {bulkUpdateImages.length > 0 && (
+                <div className="space-y-1">
+                  {bulkUpdateImages.map((file, index) => (
+                    <div key={`${file.name}-${index}`} className="flex items-center justify-between text-xs bg-muted/50 rounded-md px-2 py-1">
+                      <span className="flex items-center gap-1 text-green-600 truncate">
+                        <Image className="h-3 w-3 flex-shrink-0" />
+                        <span className="truncate">{file.name}</span>
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setBulkUpdateImages(prev => prev.filter((_, i) => i !== index))}
+                        className="text-muted-foreground hover:text-destructive ml-2 flex-shrink-0"
+                      >
+                        {language === 'he' ? 'הסר' : 'Remove'}
+                      </button>
+                    </div>
+                  ))}
+                  <p className="text-xs text-muted-foreground">
+                    {language === 'he'
+                      ? `לכל חשבון תיבחר תמונה אקראית מתוך ${bulkUpdateImages.length} התמונות שהועלו`
+                      : `A random image out of the ${bulkUpdateImages.length} uploaded will be picked for each account`}
+                  </p>
+                </div>
               )}
               <p className="text-xs text-muted-foreground">
                 {t('accounts.leaveEmptyPictures')}
@@ -496,14 +531,14 @@ export default function Accounts() {
                 onClick={() => {
                   setShowBulkUpdateDialog(false);
                   setBulkUpdateName('');
-                  setBulkUpdateImage(null);
+                  setBulkUpdateImages([]);
                 }}
               >
                 {t('common.cancel')}
               </Button>
               <Button
                 onClick={executeBulkUpdate}
-                disabled={!bulkUpdateName.trim() && !bulkUpdateImage}
+                disabled={!bulkUpdateName.trim() && bulkUpdateImages.length === 0}
               >
                 {t('accounts.updateAccountsButton').replace('{count}', selectedAccountIds.size.toString())}
               </Button>

@@ -1838,6 +1838,62 @@ const WARMUP_MESSAGES = [
   'אם נסתכל קדימה, אני חושב שיש פה פוטנציאל גדול ושכדאי לנו להיות חלק מזה',
 ];
 
+// Conversation openers: the first message that kicks off a new back-and-forth exchange
+const CONVERSATION_OPENERS = [
+  'היי, מה נשמע?',
+  'מה קורה?',
+  'שלום, איך אתה?',
+  'מה המצב?',
+  'בוקר טוב!',
+  'מה שלומך?',
+  'איך היה היום?',
+  'מה חדש?',
+  'איך הולך?',
+  'יש חדשות?',
+  'מה עושים היום?',
+  'איך העבודה?',
+  'מה התכניות שלך?',
+  'אתה פנוי?',
+  'מה קורה אצלך?',
+  'ערב טוב, מה נשמע?',
+  'שבוע טוב, איך הולך?',
+];
+
+// Direct replies to an opener - answers the greeting/question and bounces it back
+const CONVERSATION_REPLIES = [
+  'הכל מצוין, תודה! ואצלך?',
+  'ממש טוב, מה אצלך?',
+  'בסדר גמור, תודה ששאלת. ואתה?',
+  'הכל טוב, מה איתך?',
+  'לא רע, ומה שלומך?',
+  'סבבה, אצלך מה קורה?',
+  'הכל בסדר תודה, ואצלך?',
+  'מעולה, ואיך אצלך?',
+  'טוב תודה, מה חדש אצלך?',
+  'הכל זורם, מה איתך?',
+  'נהדר, ואצלך איך?',
+  'בסדר, תודה. ואתה?',
+  'לא יכול להתלונן, ואצלך?',
+  'הכל טוב בחסדי השם, ואתה?',
+  'הכל טוב, אתה מה אומר?',
+];
+
+// Follow-up messages once the opener has already been answered - closes the loop naturally
+const CONVERSATION_CONTINUATIONS = [
+  'נחמד לשמוע!',
+  'יופי, שיהיה לך יום נעים',
+  'מעולה, בהצלחה בכל מקרה',
+  'כיף לשמוע',
+  'תודה, גם לך',
+  'מגניב, נדבר בהמשך',
+  'סבבה, נהיה בקשר',
+  'אחלה, שיהיה לך יום מוצלח',
+  'שמח לשמוע, נדבר',
+  'טוב לדעת, בהצלחה',
+  'יאללה, נדבר בקרוב',
+  'מעולה, שיהיה טוב',
+];
+
 interface WarmUpState {
   isRunning: boolean;
   accountTimeouts: Map<string, NodeJS.Timeout>; // accountId -> timeout
@@ -1846,12 +1902,16 @@ interface WarmUpState {
   maxMessagesPerDay: number;
   startHour: number;
   endHour: number;
+  activeConversations: Map<string, Set<string>>; // accountId -> set of partnerIds it's currently mid-conversation with
+  maxConcurrentConversations: number; // how many simultaneous conversations one account can hold
 }
 
 export class WarmUpService {
   private db: Database;
   private whatsappManager: WhatsAppManager;
   private activeSessions: Map<string, WarmUpState> = new Map();
+  // pairKey (sorted "accountA:accountB") -> pending reply timeout for an ongoing conversation
+  private conversationTimeouts: Map<string, NodeJS.Timeout> = new Map();
 
   constructor(db: Database, whatsappManager: WhatsAppManager) {
     this.db = db;
@@ -1916,7 +1976,9 @@ export class WarmUpService {
                 lastResetDate: todayDate,
                 maxMessagesPerDay: 40,
                 startHour: 8,
-                endHour: 22
+                endHour: 22,
+                activeConversations: new Map(),
+                maxConcurrentConversations: 3
               });
               
               // Log counter reset info
@@ -2062,7 +2124,9 @@ export class WarmUpService {
       lastResetDate: new Date().toISOString().split('T')[0],
       maxMessagesPerDay: 40, // Smart limit: 40 messages per account per day
       startHour: 8,  // Start at 8 AM
-      endHour: 22    // End at 10 PM
+      endHour: 22,   // End at 10 PM
+      activeConversations: new Map(),
+      maxConcurrentConversations: 3 // an account can hold up to 3 simultaneous conversations, like a real person
     });
 
     // Get reference to the state we just created
@@ -2102,8 +2166,15 @@ export class WarmUpService {
         clearTimeout(timeout);
       }
       state.accountTimeouts.clear();
+      state.activeConversations.clear();
       this.activeSessions.delete(sessionId);
     }
+
+    // Clear any pending conversation reply timeouts so no more messages fire after stop
+    for (const timeout of this.conversationTimeouts.values()) {
+      clearTimeout(timeout);
+    }
+    this.conversationTimeouts.clear();
 
     const stmt = this.db.prepare(`
       UPDATE warmup_sessions 
@@ -2203,28 +2274,40 @@ export class WarmUpService {
       return;
     }
 
-    // Try to send message
+    // If this account already holds its max number of simultaneous conversations, skip
+    // starting a new one this cycle - the existing conversation chains drive their own timing.
+    const currentConversationCount = state.activeConversations.get(accountId)?.size || 0;
+    if (currentConversationCount >= state.maxConcurrentConversations) {
+      console.log(`🔥 💬 Account ${accountId} already has ${currentConversationCount} active conversation(s) (max ${state.maxConcurrentConversations}), skipping this cycle...`);
+      const delay = getRandomDelay(minDelay, maxDelay) * 1000;
+      const timeout = setTimeout(() => {
+        this.scheduleNextWarmUpForAccount(sessionId, allAccountIds, accountId, minDelay, maxDelay);
+      }, delay);
+      state.accountTimeouts.set(accountId, timeout);
+      return;
+    }
+
+    // Try to start a new conversation with a free partner
     let sendSuccessful = false;
     try {
-      await this.sendWarmUpMessageFromAccount(sessionId, allAccountIds, accountId);
-      sendSuccessful = true;
+      sendSuccessful = await this.startConversation(sessionId, allAccountIds, accountId);
     } catch (error) {
-      console.error(`❌ Error sending warm-up message from account ${accountId}:`, error);
+      console.error(`❌ Error starting warm-up conversation from account ${accountId}:`, error);
       console.log('🔥 Will retry on next cycle...');
       sendSuccessful = false;
     }
 
-    // Always schedule next message (whether success or failure)
-    // If failed, use shorter delay for retry
+    // Always schedule next cycle check (whether a conversation started or not)
+    // If it couldn't start (no free partner / not connected), use shorter delay for retry
     let delay: number;
     if (sendSuccessful) {
       // Normal delay (minDelay to maxDelay)
       delay = getRandomDelay(minDelay, maxDelay) * 1000;
-      console.log(`🔥 ✅ Next warm-up message from ${accountId} in ${Math.floor(delay / 1000 / 60)} minutes (${Math.floor(delay / 1000)} seconds)`);
+      console.log(`🔥 ✅ Next warm-up cycle for ${accountId} in ${Math.floor(delay / 1000 / 60)} minutes (${Math.floor(delay / 1000)} seconds)`);
     } else {
       // Shorter delay for retry (2-5 minutes)
       delay = getRandomDelay(120, 300) * 1000; // 2-5 minutes
-      console.log(`🔥 ⚠️ Retry warm-up from ${accountId} in ${Math.floor(delay / 1000 / 60)} minutes due to previous failure`);
+      console.log(`🔥 ⚠️ Retry warm-up from ${accountId} in ${Math.floor(delay / 1000 / 60)} minutes (no free partner or send failed)`);
     }
     
     const timeout = setTimeout(() => {
@@ -2235,54 +2318,184 @@ export class WarmUpService {
     console.log(`🔥 Timeout scheduled for account ${accountId} (ID: ${timeout})`);
   }
 
-  private async sendWarmUpMessageFromAccount(
+  private getPairKey(accountA: string, accountB: string): string {
+    return [accountA, accountB].sort().join(':');
+  }
+
+  private linkConversation(state: WarmUpState, accountA: string, accountB: string): void {
+    if (!state.activeConversations.has(accountA)) state.activeConversations.set(accountA, new Set());
+    if (!state.activeConversations.has(accountB)) state.activeConversations.set(accountB, new Set());
+    state.activeConversations.get(accountA)!.add(accountB);
+    state.activeConversations.get(accountB)!.add(accountA);
+  }
+
+  private releaseConversation(sessionId: string, accountA: string, accountB: string): void {
+    const state = this.activeSessions.get(sessionId);
+    if (state) {
+      state.activeConversations.get(accountA)?.delete(accountB);
+      state.activeConversations.get(accountB)?.delete(accountA);
+    }
+    this.conversationTimeouts.delete(this.getPairKey(accountA, accountB));
+  }
+
+  /**
+   * Kicks off a new conversation: finds a free connected partner for `starterId` and
+   * sends the opening message. The rest of the exchange (replies) is driven by
+   * runConversationTurn recursively swapping sender/receiver on each turn.
+   * Returns true if a conversation was successfully started, false if no partner was available.
+   */
+  private async startConversation(
     sessionId: string,
     allAccountIds: string[],
-    senderId: string
+    starterId: string
+  ): Promise<boolean> {
+    const state = this.activeSessions.get(sessionId);
+    if (!state) {
+      console.log(`🔥 Session ${sessionId} not found in active sessions`);
+      return false;
+    }
+
+    if (!this.whatsappManager.isConnected(starterId)) {
+      console.log(`🔥 Account ${starterId} is not connected, will retry on next cycle...`);
+      return false;
+    }
+
+    const client = this.whatsappManager.getConnection(starterId);
+    if (!client) {
+      console.log(`🔥 Account ${starterId} has no active client, will retry on next cycle...`);
+      return false;
+    }
+
+    try {
+      const clientState = await client.getState();
+      if (clientState !== 'CONNECTED') {
+        console.log(`🔥 Account ${starterId} not ready yet (state: ${clientState}), will retry on next cycle...`);
+        return false;
+      }
+    } catch (e) {
+      console.log(`🔥 Account ${starterId} state check failed, will retry on next cycle...`);
+      return false;
+    }
+
+    // Find a connected partner that isn't already talking to starterId and still has
+    // room for another simultaneous conversation (so accounts can juggle a few chats at once)
+    const starterPartners = state.activeConversations.get(starterId) || new Set<string>();
+    const availablePartners = allAccountIds.filter(id => {
+      if (id === starterId) return false;
+      if (!this.whatsappManager.isConnected(id)) return false;
+      if (starterPartners.has(id)) return false; // already chatting with this one
+      const partnerConversationCount = state.activeConversations.get(id)?.size || 0;
+      return partnerConversationCount < state.maxConcurrentConversations;
+    });
+
+    if (availablePartners.length === 0) {
+      console.log(`🔥 No free connected partner available for ${starterId}, will retry on next cycle...`);
+      return false;
+    }
+
+    const partnerId = availablePartners[Math.floor(Math.random() * availablePartners.length)];
+
+    // Link both accounts as being in an active conversation with each other
+    this.linkConversation(state, starterId, partnerId);
+
+    // A conversation consists of 3-6 messages total, alternating sender/receiver
+    const totalTurns = Math.floor(Math.random() * 4) + 3;
+
+    console.log(`🔥 💬 Starting conversation: ${starterId.substring(0, 8)}... ↔ ${partnerId.substring(0, 8)}... (${totalTurns} messages planned)`);
+
+    await this.runConversationTurn(sessionId, allAccountIds, starterId, partnerId, 1, totalTurns);
+    return true;
+  }
+
+  /**
+   * Sends one message in an ongoing conversation and, if more turns remain, schedules
+   * the next turn with sender/receiver swapped (i.e. the reply) after a human-like delay.
+   */
+  private async runConversationTurn(
+    sessionId: string,
+    allAccountIds: string[],
+    senderId: string,
+    receiverId: string,
+    turnNumber: number,
+    totalTurns: number
+  ): Promise<void> {
+    const state = this.activeSessions.get(sessionId);
+    if (!state || !state.isRunning) {
+      this.releaseConversation(sessionId, senderId, receiverId);
+      return;
+    }
+
+    // Respect working hours - if we've crossed outside them mid-conversation, end gracefully
+    const now = new Date();
+    const currentHour = now.getHours();
+    if (currentHour < state.startHour || currentHour >= state.endHour) {
+      console.log(`🔥 💬 Outside working hours, ending conversation early between ${senderId.substring(0, 8)}... and ${receiverId.substring(0, 8)}...`);
+      this.releaseConversation(sessionId, senderId, receiverId);
+      return;
+    }
+
+    // Respect daily message limit per account
+    const sentToday = state.messagesSentToday.get(senderId) || 0;
+    if (sentToday >= state.maxMessagesPerDay) {
+      console.log(`🔥 💬 Account ${senderId} reached daily limit mid-conversation, ending conversation early`);
+      this.releaseConversation(sessionId, senderId, receiverId);
+      return;
+    }
+
+    // Double-check sender is still connected before sending this turn
+    if (!this.whatsappManager.isConnected(senderId)) {
+      console.log(`🔥 💬 Account ${senderId} disconnected mid-conversation, ending conversation early`);
+      this.releaseConversation(sessionId, senderId, receiverId);
+      return;
+    }
+
+    // Pick a message pool based on the turn's role in the conversation
+    let pool: string[];
+    if (turnNumber === 1) {
+      pool = CONVERSATION_OPENERS;
+    } else if (turnNumber === 2) {
+      pool = CONVERSATION_REPLIES;
+    } else {
+      pool = [...CONVERSATION_REPLIES, ...CONVERSATION_CONTINUATIONS, ...WARMUP_MESSAGES];
+    }
+    const message = pool[Math.floor(Math.random() * pool.length)];
+
+    try {
+      await this.sendWarmUpTurnMessage(sessionId, senderId, receiverId, message);
+    } catch (error) {
+      console.error(`🔥 ❌ Conversation turn failed (${senderId.substring(0, 8)}... → ${receiverId.substring(0, 8)}...):`, error);
+    }
+
+    if (turnNumber >= totalTurns) {
+      console.log(`🔥 💬 Conversation finished between ${senderId.substring(0, 8)}... and ${receiverId.substring(0, 8)}... (${totalTurns} messages)`);
+      this.releaseConversation(sessionId, senderId, receiverId);
+      return;
+    }
+
+    // Schedule the reply: swap sender/receiver, with a short human-like "typing/thinking" delay
+    const replyDelay = getRandomDelay(20, 90) * 1000; // 20-90 seconds
+    const pairKey = this.getPairKey(senderId, receiverId);
+    const timeout = setTimeout(() => {
+      this.runConversationTurn(sessionId, allAccountIds, receiverId, senderId, turnNumber + 1, totalTurns);
+    }, replyDelay);
+    this.conversationTimeouts.set(pairKey, timeout);
+  }
+
+  /**
+   * Sends a single, already-chosen message from senderId to receiverId and logs it.
+   * Used exclusively by runConversationTurn for each step of a conversation exchange.
+   */
+  private async sendWarmUpTurnMessage(
+    sessionId: string,
+    senderId: string,
+    receiverId: string,
+    message: string
   ): Promise<void> {
     const state = this.activeSessions.get(sessionId);
     if (!state) {
       console.log(`🔥 Session ${sessionId} not found in active sessions`);
       return;
     }
-
-    // Check if sender is connected
-    if (!this.whatsappManager.isConnected(senderId)) {
-      console.log(`🔥 Account ${senderId} is not connected, will retry on next cycle...`);
-      return; // Will be retried by scheduleNextWarmUpForAccount
-    }
-
-    // Get client to check state
-    const client = this.whatsappManager.getConnection(senderId);
-    if (!client) {
-      console.log(`🔥 Account ${senderId} has no active client, will retry on next cycle...`);
-      return; // Will be retried by scheduleNextWarmUpForAccount
-    }
-
-    // Verify client is truly ready
-    try {
-      const clientState = await client.getState();
-      if (clientState !== 'CONNECTED') {
-        console.log(`🔥 Account ${senderId} not ready yet (state: ${clientState}), will retry on next cycle...`);
-        return; // Will be retried by scheduleNextWarmUpForAccount
-      }
-    } catch (e) {
-      console.log(`🔥 Account ${senderId} state check failed, will retry on next cycle...`);
-      return; // Will be retried by scheduleNextWarmUpForAccount
-    }
-
-    // Filter other connected accounts (exclude sender)
-    const otherAccounts = allAccountIds.filter(id => 
-      id !== senderId && this.whatsappManager.isConnected(id)
-    );
-
-    if (otherAccounts.length === 0) {
-      console.log(`🔥 No other connected accounts available for ${senderId}, will retry on next cycle...`);
-      return; // Will be retried by scheduleNextWarmUpForAccount
-    }
-
-    // Select random receiver from other accounts
-    const receiverId = otherAccounts[Math.floor(Math.random() * otherAccounts.length)];
 
     // Get receiver's phone number
     const stmt = this.db.prepare('SELECT phone_number FROM accounts WHERE id = ?');
@@ -2295,45 +2508,30 @@ export class WarmUpService {
 
     // Clean and format phone number properly
     let receiverPhone = receiver.phone_number;
-    
-    console.log(`🔥 Raw phone from DB: "${receiverPhone}"`);
-    
+
     // Remove all non-digits and any WhatsApp suffix if exists
     receiverPhone = receiverPhone.replace(/\D/g, ''); // Remove +, -, spaces, @c.us, @lid, etc.
-    
-    console.log(`🔥 Cleaned phone: "${receiverPhone}"`);
-    
+
     // Ensure it has country code
     if (!receiverPhone.startsWith('972') && !receiverPhone.startsWith('1') && !receiverPhone.startsWith('44')) {
       console.error(`❌ Invalid phone number format: ${receiver.phone_number} → ${receiverPhone}`);
       return;
     }
 
-    console.log(`🔥 Warm-up: Sender ${senderId.substring(0, 8)}... → Receiver ${receiverId.substring(0, 8)}... (${receiverPhone})`);
-
-    // Select random message
-    const messageIndex = Math.floor(Math.random() * WARMUP_MESSAGES.length);
-    const message = WARMUP_MESSAGES[messageIndex];
-    
-    console.log(`🔥 Selected message #${messageIndex} from ${WARMUP_MESSAGES.length} messages`);
-    console.log(`🔥 Message to send: "${message}"`);
-    console.log(`🔥 Message length: ${message.length} characters`);
+    console.log(`🔥 💬 Conversation turn: ${senderId.substring(0, 8)}... → ${receiverId.substring(0, 8)}... (${receiverPhone}): "${message}"`);
 
     try {
       // Add small random delay (0-10 seconds) to make it more natural
       const naturalDelay = Math.floor(Math.random() * 10000);
       if (naturalDelay > 0) {
-        console.log(`🔥 Adding natural delay of ${naturalDelay / 1000}s before sending...`);
         await new Promise(resolve => setTimeout(resolve, naturalDelay));
       }
-      
-      console.log(`🔥 Calling sendMessage with: senderId=${senderId.substring(0, 8)}, to=${receiverPhone}, message="${message}", isWarmup=true`);
-      
+
       // Send message - will be formatted to @c.us in sendMessage (NOT @lid!)
       // Mark as warmup so it won't show in Inbox
       await this.whatsappManager.sendMessage(senderId, receiverPhone, message, true);
-      
-      console.log(`✅ Warm-up message sent successfully!`);
+
+      console.log(`✅ Warm-up conversation message sent successfully!`);
 
       // Save to warmup_messages log
       try {
@@ -2361,9 +2559,8 @@ export class WarmUpService {
       const timestamp = new Date().toLocaleTimeString();
       console.log(`🔥 ✅ Warm-up [${timestamp}]: ${senderId.substring(0, 8)}... sent message #${currentCount + 1}/${state.maxMessagesPerDay}`);
     } catch (error) {
-      console.error(`❌ Failed to send warm-up message:`, error);
-      console.log(`🔥 ⚠️ Will retry on next cycle...`);
-      // Don't throw - let scheduleNextWarmUpForAccount handle retry
+      console.error(`❌ Failed to send warm-up conversation message:`, error);
+      throw error;
     }
   }
 

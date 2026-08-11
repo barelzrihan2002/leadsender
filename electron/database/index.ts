@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS campaigns (
   target_group_name TEXT,
   group_source_account_id TEXT,
   source_tag_ids TEXT,
+  message_variants TEXT,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   started_at DATETIME,
   completed_at DATETIME
@@ -260,6 +261,12 @@ CREATE TABLE IF NOT EXISTS flow_executions (
   FOREIGN KEY (flow_id) REFERENCES flows(id) ON DELETE CASCADE
 );
 
+-- Global key/value app settings (DuoPlus API key, tap calibration, etc.)
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY,
+  value TEXT
+);
+
 -- Software Chats table (Inbox)
 CREATE TABLE IF NOT EXISTS chats (
   id TEXT PRIMARY KEY,
@@ -443,6 +450,13 @@ export async function initDatabase() {
     // Column already exists
   }
 
+  // Add message variants for random message selection at send time
+  try {
+    db.exec(`ALTER TABLE campaigns ADD COLUMN message_variants TEXT;`);
+  } catch (e) {
+    // Column already exists
+  }
+
   // Add custom_fields column to contacts
   try {
     db.exec(`ALTER TABLE contacts ADD COLUMN custom_fields TEXT;`);
@@ -489,6 +503,20 @@ export async function initDatabase() {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_software_chat_id ON messages(software_chat_id);`);
   } catch (e) {
     // Index already exists or column not ready
+  }
+
+  // Add DuoPlus cloud-phone device id to accounts
+  try {
+    db.exec(`ALTER TABLE accounts ADD COLUMN duoplus_device_id TEXT;`);
+  } catch (e) {
+    // Column already exists
+  }
+
+  // Add send_mode to campaigns ('web' = WhatsApp Web, 'cloud_phone' = DuoPlus cloud phone)
+  try {
+    db.exec(`ALTER TABLE campaigns ADD COLUMN send_mode TEXT DEFAULT 'web';`);
+  } catch (e) {
+    // Column already exists
   }
 
   // Create migrations tracking table

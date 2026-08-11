@@ -1,5 +1,6 @@
 import type { Database } from 'better-sqlite3';
 import type { WhatsAppManager } from './WhatsAppManager';
+import type { DuoPlusManager } from './DuoPlusManager';
 import { BrowserWindow } from 'electron';
 import { replaceVariables, getRandomDelay } from '../../src/lib/utils';
 import { v4 as uuidv4 } from 'uuid';
@@ -24,11 +25,13 @@ interface SendNextMessageResult {
 export class CampaignScheduler {
   private db: Database;
   private whatsappManager: WhatsAppManager;
+  private duoplusManager?: DuoPlusManager;
   private activeCampaigns: Map<string, CampaignState> = new Map();
 
-  constructor(db: Database, whatsappManager: WhatsAppManager) {
+  constructor(db: Database, whatsappManager: WhatsAppManager, duoplusManager?: DuoPlusManager) {
     this.db = db;
     this.whatsappManager = whatsappManager;
+    this.duoplusManager = duoplusManager;
 
     // Reset daily counters at midnight
     this.startDailyReset();
@@ -202,6 +205,50 @@ export class CampaignScheduler {
 
   private isGroupAdderCampaign(campaign: any): boolean {
     return campaign?.campaign_type === 'group_adder';
+  }
+
+  /**
+   * Sends a text-only WhatsApp message through the DuoPlus cloud phone linked to `accountId`,
+   * instead of the WhatsApp Web session. Powers the cloud phone on first if needed.
+   *
+   * Triggering the ADB tap/keyevent only proves the *command* executed - it does not prove
+   * WhatsApp on the phone actually delivered the message (e.g. the send button could have been
+   * missed, the chat could have not loaded, etc). To catch that, the account's WhatsApp Web
+   * session (kept connected as a linked device, but never used to send) is used afterwards to
+   * confirm a new outgoing message actually appeared in that chat before we consider this a success.
+   */
+  private async sendViaCloudPhone(accountId: string, phoneNumber: string, message: string): Promise<void> {
+    if (!this.duoplusManager) {
+      throw new Error('DuoPlus integration is not available');
+    }
+
+    const accountStmt = this.db.prepare('SELECT duoplus_device_id FROM accounts WHERE id = ?');
+    const account = accountStmt.get(accountId) as { duoplus_device_id?: string } | undefined;
+
+    if (!account?.duoplus_device_id) {
+      throw new Error('This account has no DuoPlus device ID configured');
+    }
+
+    if (!this.whatsappManager.isConnected(accountId)) {
+      throw new Error('This account\'s WhatsApp Web session must be connected to verify cloud-phone sends');
+    }
+
+    const online = await this.duoplusManager.ensureOnline(account.duoplus_device_id);
+    if (!online) {
+      throw new Error('DuoPlus cloud phone did not come online in time');
+    }
+
+    // Small buffer to tolerate clock drift between this machine and WhatsApp's server-side message timestamp
+    const sentAfter = Date.now() - 10000;
+    await this.duoplusManager.sendWhatsAppTextViaIntent(account.duoplus_device_id, phoneNumber, message);
+
+    const verified = await this.whatsappManager.waitForOutgoingMessage(accountId, phoneNumber, sentAfter);
+    if (!verified) {
+      throw new Error(
+        'Could not verify the message was actually sent from the cloud phone - no new outgoing message ' +
+        'was detected in WhatsApp Web for this chat. The tap/keyevent may have missed the send button.'
+      );
+    }
   }
 
   private markRemainingPendingContactsAsFailed(campaignId: string, error: string, resultCode: string): void {
@@ -382,6 +429,30 @@ export class CampaignScheduler {
     }
 
     return { success: false };
+  }
+
+  private async handleGroupAdderBatch(
+    campaignId: string,
+    accountId: string,
+    contacts: any[],
+    state: CampaignState,
+    campaign: any
+  ): Promise<SendNextMessageResult> {
+    let processedAny = false;
+
+    for (const contact of contacts) {
+      const result = await this.handleGroupAdderContact(campaignId, accountId, contact, state, campaign);
+
+      if (result.success) {
+        processedAny = true;
+      }
+
+      if (result.finished) {
+        return processedAny ? { ...result, success: true } : result;
+      }
+    }
+
+    return { success: processedAny };
   }
 
   async startCampaign(campaignId: string): Promise<void> {
@@ -689,7 +760,7 @@ export class CampaignScheduler {
      this.scheduleAccountTimeout(campaignId, accountId, delay, runId);
    }
  
-  private claimNextPendingContact(campaignId: string, accountId: string, campaign: any): any | null {
+  private claimPendingContacts(campaignId: string, accountId: string, campaign: any, limit: number = 1): any[] {
     let contactQuery = `
       SELECT cc.* FROM campaign_contacts cc
       WHERE cc.campaign_id = ? AND cc.status = 'pending'
@@ -728,29 +799,35 @@ export class CampaignScheduler {
       console.log(`📋 Skip recent contacts DISABLED`);
     }
     
-    contactQuery += ` LIMIT 1`;
+    const safeLimit = Math.max(1, Math.floor(limit));
+    contactQuery += ` LIMIT ${safeLimit}`;
 
-    const claimContact = this.db.transaction(() => {
+    const claimContacts = this.db.transaction(() => {
       const contactStmt = this.db.prepare(contactQuery);
-      const contact = contactStmt.get(campaignId) as any;
-      if (!contact) {
-        return null;
-      }
-
       const claimStmt = this.db.prepare(`
         UPDATE campaign_contacts 
         SET status = 'sending', sent_by_account_id = ?, error = NULL
         WHERE id = ? AND status = 'pending'
       `);
-      const claimResult = claimStmt.run(accountId, contact.id);
-      if (claimResult.changes === 0) {
-        return null;
+
+      const contacts = contactStmt.all(campaignId) as any[];
+      if (!contacts.length) {
+        return [];
       }
 
-      return { ...contact, status: 'sending', sent_by_account_id: accountId };
+      const claimedContacts: any[] = [];
+
+      for (const contact of contacts) {
+        const claimResult = claimStmt.run(accountId, contact.id);
+        if (claimResult.changes > 0) {
+          claimedContacts.push({ ...contact, status: 'sending', sent_by_account_id: accountId });
+        }
+      }
+
+      return claimedContacts;
     });
 
-    return claimContact();
+    return claimContacts();
   }
 
   private async sendNextMessageFromAccount(campaignId: string, accountId: string, runId: string): Promise<SendNextMessageResult> {
@@ -781,7 +858,9 @@ export class CampaignScheduler {
       return { success: false, delayMs: delay };
     }
 
-    // Check if account is connected BEFORE claiming a contact
+    // Check if account is connected BEFORE claiming a contact.
+    // Cloud-phone campaigns don't send through the WhatsApp Web session, but that session must
+    // stay connected so we can verify (as a linked device) that the cloud phone actually sent the message.
     if (!this.whatsappManager.isConnected(accountId)) {
       console.log(`⚠️ Account ${accountId.substring(0, 8)}... is not connected - skipping this cycle`);
       
@@ -804,10 +883,20 @@ export class CampaignScheduler {
     // CLAIM PATTERN: Get next pending contact and immediately mark as 'sending'
     // This prevents other accounts from taking the same contact
     // IMPORTANT: Skip contacts in BlackList and skip recent contacts if enabled
-    const contact = this.claimNextPendingContact(campaignId, accountId, campaign);
+    const remainingDailyCapacity = Math.max(0, campaign.max_messages_per_day - sentToday);
+    const groupAdderBatchSize = this.isGroupAdderCampaign(campaign)
+      ? Math.min(10, remainingDailyCapacity)
+      : 1;
+
+    const contacts = this.claimPendingContacts(campaignId, accountId, campaign, groupAdderBatchSize || 1);
+    const contact = contacts[0] || null;
 
     if (contact) {
-      console.log(`📞 Selected contact: ${contact.phone_number}`);
+      if (this.isGroupAdderCampaign(campaign)) {
+        console.log(`📞 Selected ${contacts.length} contacts for group add batch`);
+      } else {
+        console.log(`📞 Selected contact: ${contact.phone_number}`);
+      }
       
       // Debug: check if this contact received messages recently
       if (campaign.skip_recent_contacts && campaign.skip_recent_days) {
@@ -937,7 +1026,7 @@ export class CampaignScheduler {
     }
 
     if (this.isGroupAdderCampaign(campaign)) {
-      return this.handleGroupAdderContact(campaignId, accountId, contact, state, campaign);
+      return this.handleGroupAdderBatch(campaignId, accountId, contacts, state, campaign);
     }
 
     // Get contact details for variable replacement
@@ -954,11 +1043,15 @@ export class CampaignScheduler {
       custom2: ''
     };
     
-    const message = replaceVariables(campaign.message, variables);
+    const messagePool = this.getMessageVariantPool(campaign);
+    const chosenMessage = messagePool[Math.floor(Math.random() * messagePool.length)];
+    const message = replaceVariables(chosenMessage, variables);
 
     try {
-      // Check if campaign has media attached
-      if (campaign.media_path && campaign.media_type) {
+      if (campaign.send_mode === 'cloud_phone') {
+        // Cloud-phone mode: send text only, through the DuoPlus cloud phone assigned to this account
+        await this.sendViaCloudPhone(accountId, contact.phone_number, message);
+      } else if (campaign.media_path && campaign.media_type) {
         // Send media with optional caption
         const caption = campaign.media_caption || message;
         await this.whatsappManager.sendMediaFromPath(accountId, contact.phone_number, campaign.media_path, caption, false);
@@ -1096,6 +1189,29 @@ export class CampaignScheduler {
   private getCampaign(campaignId: string): any {
     const stmt = this.db.prepare('SELECT * FROM campaigns WHERE id = ?');
     return stmt.get(campaignId);
+  }
+
+  private getMessageVariantPool(campaign: any): string[] {
+    let extraVariants: string[] = [];
+
+    if (Array.isArray(campaign.message_variants)) {
+      extraVariants = campaign.message_variants;
+    } else if (typeof campaign.message_variants === 'string' && campaign.message_variants.trim()) {
+      try {
+        const parsed = JSON.parse(campaign.message_variants);
+        if (Array.isArray(parsed)) {
+          extraVariants = parsed;
+        }
+      } catch {
+        // Ignore malformed JSON, fall back to primary message only
+      }
+    }
+
+    const pool = [campaign.message, ...extraVariants].filter(
+      (variant): variant is string => typeof variant === 'string' && variant.trim().length > 0
+    );
+
+    return pool.length > 0 ? pool : [campaign.message];
   }
 
   private async completeCampaign(campaignId: string): Promise<void> {

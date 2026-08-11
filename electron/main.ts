@@ -1,10 +1,10 @@
 import path from 'path';
 import fs from 'fs';
 import { app, BrowserWindow, Menu, protocol } from 'electron';
-import { autoUpdater } from 'electron-updater';
 import { initDatabase } from './database/index';
 import { setupIPCHandlers, campaignScheduler, warmUpService } from './ipc';
 import { logger } from './logger';
+import { setupAutoUpdater, setUpdaterMainWindow } from './updater';
 
 // Register custom protocol for serving local files (e.g. chat photos)
 protocol.registerSchemesAsPrivileged([
@@ -13,6 +13,16 @@ protocol.registerSchemesAsPrivileged([
 
 // Initialize logger immediately to capture all logs
 console.log('🚀 LeadSender starting...');
+
+// Safety net: whatsapp-web.js internally fires some page.evaluate() calls
+// (e.g. requestPairingCode) outside of the promise chain we await, so a
+// rejection there (e.g. page/context closed mid-evaluation) can surface as an
+// unhandled rejection here rather than at our call site. Without this handler
+// Node prints a raw, unformatted warning; catching it lets us log it through
+// our logger without crashing the app.
+process.on('unhandledRejection', (reason) => {
+  console.error('⚠️ Unhandled promise rejection (caught, app continues running):', reason);
+});
 
 let mainWindow: BrowserWindow | null = null;
 
@@ -65,7 +75,10 @@ function createWindow() {
 
   mainWindow.on('closed', () => {
     mainWindow = null;
+    setUpdaterMainWindow(null);
   });
+
+  setUpdaterMainWindow(mainWindow);
 
   // DevTools control in production
   if (!isDev) {
@@ -146,87 +159,6 @@ function createWindow() {
       menu.popup();
     }
   });
-}
-
-// ==================== AUTO-UPDATER ====================
-function setupAutoUpdater() {
-  const isDev = process.env.VITE_DEV_SERVER_URL;
-  
-  // Don't check for updates in development mode
-  if (isDev) {
-    console.log('🔧 Development mode - auto-updater disabled');
-    return;
-  }
-
-  // Configure auto-updater
-  autoUpdater.autoDownload = false; // Don't download automatically - ask user first
-  autoUpdater.autoInstallOnAppQuit = true; // Install automatically when app quits
-
-  // Log all auto-updater events
-  autoUpdater.on('checking-for-update', () => {
-    console.log('🔍 Checking for updates...');
-    mainWindow?.webContents.send('updater:checking-for-update');
-  });
-
-  autoUpdater.on('update-available', (info) => {
-    console.log('✅ Update available:', info.version);
-    mainWindow?.webContents.send('updater:update-available', {
-      version: info.version,
-      releaseDate: info.releaseDate,
-      releaseNotes: info.releaseNotes
-    });
-  });
-
-  autoUpdater.on('update-not-available', (info) => {
-    console.log('✅ App is up to date:', info.version);
-    mainWindow?.webContents.send('updater:update-not-available');
-  });
-
-  autoUpdater.on('error', (err) => {
-    console.error('❌ Error in auto-updater:', err);
-    mainWindow?.webContents.send('updater:error', err.message);
-  });
-
-  autoUpdater.on('download-progress', (progressObj) => {
-    const log = `Downloaded ${progressObj.percent.toFixed(2)}% (${progressObj.transferred}/${progressObj.total})`;
-    console.log('⬇️', log);
-    mainWindow?.webContents.send('updater:download-progress', {
-      percent: progressObj.percent,
-      transferred: progressObj.transferred,
-      total: progressObj.total,
-      bytesPerSecond: progressObj.bytesPerSecond
-    });
-  });
-
-  autoUpdater.on('update-downloaded', (info) => {
-    console.log('✅ Update downloaded:', info.version);
-    mainWindow?.webContents.send('updater:update-downloaded', {
-      version: info.version
-    });
-  });
-
-  // Check for updates when app starts (after a 3-second delay to let the app load)
-  setTimeout(() => {
-    console.log('🚀 Starting auto-update check...');
-    autoUpdater.checkForUpdates().catch(err => {
-      console.error('❌ Failed to check for updates:', err);
-    });
-  }, 3000);
-}
-
-// Export function to manually check for updates
-export function checkForUpdates() {
-  return autoUpdater.checkForUpdates();
-}
-
-// Export function to download update
-export function downloadUpdate() {
-  return autoUpdater.downloadUpdate();
-}
-
-// Export function to install update
-export function quitAndInstall() {
-  autoUpdater.quitAndInstall();
 }
 
 app.whenReady().then(async () => {

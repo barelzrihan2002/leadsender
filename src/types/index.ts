@@ -13,8 +13,25 @@ export interface Account {
   qr_code?: string;
   pairing_code?: string;
   profile_picture_url?: string;
+  duoplus_device_id?: string;
   last_seen?: string;
   created_at: string;
+}
+
+// DuoPlus cloud-phone integration types
+export type DuoPlusTapMode = 'auto' | 'coordinates' | 'enter';
+
+export interface DuoPlusSettings {
+  apiKey: string;
+  tapMode: DuoPlusTapMode;
+  tapX: number | null;
+  tapY: number | null;
+}
+
+export interface DuoPlusStatusItem {
+  id: string;
+  name: string;
+  status: number;
 }
 
 export interface ProxyConfig {
@@ -109,6 +126,8 @@ export interface Campaign {
   target_group_name?: string;
   group_source_account_id?: string;
   source_tag_ids?: string[];
+  message_variants?: string[]; // גרסאות נוספות של ההודעה, נבחרת אחת אקראית בכל שליחה
+  send_mode?: 'web' | 'cloud_phone'; // 'cloud_phone' = send via DuoPlus cloud phone (text only)
   created_at: string;
   started_at?: string;
   completed_at?: string;
@@ -363,6 +382,14 @@ export interface ElectronAPI {
     updateWhatsAppName: (id: string, name: string) => Promise<void>;
     updateWhatsAppImage: (id: string, imagePath: string) => Promise<void>;
     refreshProfilePicture: (id: string) => Promise<void>;
+    setDuoplusDeviceId: (id: string, deviceId: string | null) => Promise<void>;
+  };
+
+  // DuoPlus cloud-phone operations
+  duoplus: {
+    getSettings: () => Promise<DuoPlusSettings>;
+    saveSettings: (settings: Partial<DuoPlusSettings>) => Promise<void>;
+    testDevice: (deviceId: string) => Promise<DuoPlusStatusItem | null>;
   };
 
   // Campaign operations

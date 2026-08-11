@@ -29,6 +29,13 @@ const electronAPI: ElectronAPI = {
     updateWhatsAppName: (id, name) => ipcRenderer.invoke('accounts:updateWhatsAppName', id, name),
     updateWhatsAppImage: (id, imagePath) => ipcRenderer.invoke('accounts:updateWhatsAppImage', id, imagePath),
     refreshProfilePicture: (id) => ipcRenderer.invoke('accounts:refreshProfilePicture', id),
+    setDuoplusDeviceId: (id, deviceId) => ipcRenderer.invoke('accounts:setDuoplusDeviceId', id, deviceId),
+  },
+
+  duoplus: {
+    getSettings: () => ipcRenderer.invoke('duoplus:getSettings'),
+    saveSettings: (settings) => ipcRenderer.invoke('duoplus:saveSettings', settings),
+    testDevice: (deviceId) => ipcRenderer.invoke('duoplus:testDevice', deviceId),
   },
 
   campaigns: {

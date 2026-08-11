@@ -1,6 +1,6 @@
 {
   "name": "leadsender",
-  "version": "3.0.3",
+  "version": "4.0.3",
   "description": "WhatsApp Campaign Desktop Application",
   "author": "LeadSender",
   "main": "dist-electron/main.js",

@@ -10,6 +10,7 @@ import { LicenseManager } from './services/LicenseManager';
 import { ScheduledCampaignChecker } from './services/ScheduledCampaignChecker';
 import { FlowEngine } from './services/FlowEngine';
 import { GroupCampaignScheduler } from './services/GroupCampaignScheduler';
+import { DuoPlusManager } from './services/DuoPlusManager';
 import { logger } from './logger';
 import * as XLSX from 'xlsx';
 import fs from 'fs';
@@ -23,6 +24,7 @@ let licenseManager: LicenseManager;
 let scheduledCampaignChecker: ScheduledCampaignChecker;
 let flowEngine: FlowEngine;
 let groupCampaignScheduler: GroupCampaignScheduler;
+let duoplusManager: DuoPlusManager;
 
 // Helper function to normalize phone numbers for matching
 function normalizePhoneForMatching(phone: string): string[] {
@@ -94,6 +96,30 @@ function serializeSourceTagIds(sourceTagIds: unknown): string | null {
   return normalized.length > 0 ? JSON.stringify([...new Set(normalized)]) : null;
 }
 
+function parseMessageVariants(messageVariants: unknown): string[] {
+  if (Array.isArray(messageVariants)) {
+    return messageVariants.filter((variant): variant is string => typeof variant === 'string' && variant.trim().length > 0);
+  }
+
+  if (typeof messageVariants !== 'string' || !messageVariants.trim()) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(messageVariants);
+    return Array.isArray(parsed)
+      ? parsed.filter((variant): variant is string => typeof variant === 'string' && variant.trim().length > 0)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function serializeMessageVariants(messageVariants: unknown): string | null {
+  const normalized = parseMessageVariants(messageVariants);
+  return normalized.length > 0 ? JSON.stringify(normalized) : null;
+}
+
 function normalizeCampaignRow(campaign: any): Campaign | null {
   if (!campaign) {
     return null;
@@ -102,8 +128,10 @@ function normalizeCampaignRow(campaign: any): Campaign | null {
   return {
     ...campaign,
     campaign_type: campaign.campaign_type || 'message',
+    send_mode: campaign.send_mode === 'cloud_phone' ? 'cloud_phone' : 'web',
     skip_recent_contacts: Boolean(campaign.skip_recent_contacts),
-    source_tag_ids: parseSourceTagIds(campaign.source_tag_ids)
+    source_tag_ids: parseSourceTagIds(campaign.source_tag_ids),
+    message_variants: parseMessageVariants(campaign.message_variants)
   };
 }
 
@@ -116,7 +144,7 @@ async function initializeServices() {
   
   console.log('🚀 Initializing WhatsApp and Campaign services...');
   whatsappManager = new WhatsAppManager(db);
-  campaignScheduler = new CampaignScheduler(db, whatsappManager);
+  campaignScheduler = new CampaignScheduler(db, whatsappManager, duoplusManager);
   warmUpService = new WarmUpService(db, whatsappManager);
   inboxManager = new InboxManager(db, whatsappManager);
   
@@ -142,6 +170,10 @@ async function initializeServices() {
 
 export function setupIPCHandlers() {
   const db = getDatabase();
+
+  // DuoPlus manager is lightweight (just reads/writes the `settings` table and
+  // calls the DuoPlus REST API) so it doesn't need to wait for license validation.
+  duoplusManager = new DuoPlusManager(db);
 
   // Initialize only license manager (lightweight)
   licenseManager = new LicenseManager();
@@ -304,6 +336,25 @@ export function setupIPCHandlers() {
     await whatsappManager.refreshProfilePicture(id);
   });
 
+  ipcMain.handle('accounts:setDuoplusDeviceId', async (_event, id: string, deviceId: string | null) => {
+    const stmt = db.prepare('UPDATE accounts SET duoplus_device_id = ? WHERE id = ?');
+    stmt.run(deviceId || null, id);
+  });
+
+  // ==================== DUOPLUS HANDLERS ====================
+  ipcMain.handle('duoplus:getSettings', async () => {
+    return duoplusManager.getSettings();
+  });
+
+  ipcMain.handle('duoplus:saveSettings', async (_event, settings: any) => {
+    duoplusManager.saveSettings(settings);
+  });
+
+  ipcMain.handle('duoplus:testDevice', async (_event, deviceId: string) => {
+    const [status] = await duoplusManager.getCloudPhoneStatus([deviceId]);
+    return status || null;
+  });
+
   // ==================== CAMPAIGN HANDLERS ====================
   ipcMain.handle('campaigns:getAll', async () => {
     const stmt = db.prepare('SELECT * FROM campaigns ORDER BY created_at DESC');
@@ -317,9 +368,15 @@ export function setupIPCHandlers() {
 
   ipcMain.handle('campaigns:create', async (_event, data: Partial<Campaign> & { media_path?: string, media_type?: string, media_caption?: string, scheduled_start_datetime?: string, messages_before_break?: number, break_duration?: number, skip_recent_contacts?: boolean, skip_recent_days?: number }) => {
     const id = uuidv4();
+    const sendMode = data.send_mode === 'cloud_phone' ? 'cloud_phone' : 'web';
+    // Cloud-phone send mode only supports text - never persist media for it
+    const mediaPath = sendMode === 'cloud_phone' ? null : (data.media_path || null);
+    const mediaType = sendMode === 'cloud_phone' ? null : (data.media_type || null);
+    const mediaCaption = sendMode === 'cloud_phone' ? null : (data.media_caption || null);
+
     const stmt = db.prepare(`
-      INSERT INTO campaigns (id, name, message, campaign_type, min_delay, max_delay, max_messages_per_day, start_hour, end_hour, media_path, media_type, media_caption, scheduled_start_datetime, messages_before_break, break_duration, skip_recent_contacts, skip_recent_days, target_group_id, target_group_name, group_source_account_id, source_tag_ids)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO campaigns (id, name, message, campaign_type, min_delay, max_delay, max_messages_per_day, start_hour, end_hour, media_path, media_type, media_caption, scheduled_start_datetime, messages_before_break, break_duration, skip_recent_contacts, skip_recent_days, target_group_id, target_group_name, group_source_account_id, source_tag_ids, message_variants, send_mode)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     
     stmt.run(
@@ -332,9 +389,9 @@ export function setupIPCHandlers() {
       data.max_messages_per_day || 100,
       data.start_hour || 9,
       data.end_hour || 18,
-      data.media_path || null,
-      data.media_type || null,
-      data.media_caption || null,
+      mediaPath,
+      mediaType,
+      mediaCaption,
       data.scheduled_start_datetime || null,
       data.messages_before_break || null,
       data.break_duration || null,
@@ -343,7 +400,9 @@ export function setupIPCHandlers() {
       data.target_group_id || null,
       data.target_group_name || null,
       data.group_source_account_id || null,
-      serializeSourceTagIds(data.source_tag_ids)
+      serializeSourceTagIds(data.source_tag_ids),
+      serializeMessageVariants(data.message_variants),
+      sendMode
     );
 
     const getStmt = db.prepare('SELECT * FROM campaigns WHERE id = ?');
@@ -398,6 +457,10 @@ export function setupIPCHandlers() {
       updates.push('status = ?');
       values.push(data.status);
     }
+    if (data.send_mode !== undefined) {
+      updates.push('send_mode = ?');
+      values.push(data.send_mode === 'cloud_phone' ? 'cloud_phone' : 'web');
+    }
     
     // Timing settings
     if (data.min_delay !== undefined) {
@@ -421,18 +484,19 @@ export function setupIPCHandlers() {
       values.push(data.end_hour);
     }
     
-    // Media fields
+    // Media fields - cloud-phone send mode only supports text, so media is never persisted for it
+    const isCloudPhoneMode = data.send_mode === 'cloud_phone';
     if (data.media_path !== undefined) {
       updates.push('media_path = ?');
-      values.push(data.media_path);
+      values.push(isCloudPhoneMode ? null : data.media_path);
     }
     if (data.media_type !== undefined) {
       updates.push('media_type = ?');
-      values.push(data.media_type);
+      values.push(isCloudPhoneMode ? null : data.media_type);
     }
     if (data.media_caption !== undefined) {
       updates.push('media_caption = ?');
-      values.push(data.media_caption);
+      values.push(isCloudPhoneMode ? null : data.media_caption);
     }
     
     // Break settings
@@ -473,6 +537,11 @@ export function setupIPCHandlers() {
     if (data.source_tag_ids !== undefined) {
       updates.push('source_tag_ids = ?');
       values.push(serializeSourceTagIds(data.source_tag_ids));
+    }
+
+    if (data.message_variants !== undefined) {
+      updates.push('message_variants = ?');
+      values.push(serializeMessageVariants(data.message_variants));
     }
     
     // Scheduling
@@ -2758,17 +2827,17 @@ export function setupIPCHandlers() {
 
   // ==================== AUTO-UPDATER HANDLERS ====================
   ipcMain.handle('updater:check-for-updates', async () => {
-    const { checkForUpdates } = await import('./main');
+    const { checkForUpdates } = await import('./updater');
     return checkForUpdates();
   });
 
   ipcMain.handle('updater:download-update', async () => {
-    const { downloadUpdate } = await import('./main');
+    const { downloadUpdate } = await import('./updater');
     return downloadUpdate();
   });
 
-  ipcMain.handle('updater:install-update', () => {
-    const { quitAndInstall } = require('./main');
+  ipcMain.handle('updater:install-update', async () => {
+    const { quitAndInstall } = await import('./updater');
     quitAndInstall();
   });
 

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { User, Mail, Calendar, Key, Languages, Shield, Info, CreditCard, Monitor, Globe, Download, RefreshCw, CheckCircle } from 'lucide-react';
+import { User, Mail, Calendar, Key, Languages, Shield, Info, CreditCard, Monitor, Globe, Download, RefreshCw, CheckCircle, Smartphone, Save } from 'lucide-react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Label } from '@/components/ui/label';
 import { Input } from '@/components/ui/input';
@@ -10,7 +10,7 @@ import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
 import { useLanguage } from '@/contexts/LanguageContext';
 import { api } from '@/lib/api';
-import type { LicenseInfo } from '@/types';
+import type { LicenseInfo, DuoPlusSettings } from '@/types';
 
 export default function Settings() {
   const { language, setLanguage, t, dir } = useLanguage();
@@ -24,10 +24,13 @@ export default function Settings() {
   const [updateDownloaded, setUpdateDownloaded] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [newVersion, setNewVersion] = useState<string>('');
+  const [duoplusSettings, setDuoplusSettings] = useState<DuoPlusSettings>({ apiKey: '', tapMode: 'auto', tapX: null, tapY: null });
+  const [savingDuoplus, setSavingDuoplus] = useState(false);
 
   useEffect(() => {
     loadSettings();
     loadVersion();
+    loadDuoplusSettings();
     setupUpdateListeners();
 
     return () => {
@@ -163,6 +166,32 @@ export default function Settings() {
 
   const handleLanguageChange = (lang: 'en' | 'he') => {
     setLanguage(lang);
+  };
+
+  const loadDuoplusSettings = async () => {
+    try {
+      const settings = await api.duoplus.getSettings();
+      setDuoplusSettings(settings);
+    } catch (error) {
+      console.error('Failed to load DuoPlus settings:', error);
+    }
+  };
+
+  const saveDuoplusSettings = async () => {
+    setSavingDuoplus(true);
+    try {
+      await api.duoplus.saveSettings(duoplusSettings);
+      toast.success(
+        language === 'he' ? 'הגדרות DuoPlus נשמרו' : language === 'ar' ? 'تم حفظ إعدادات DuoPlus' : 'DuoPlus settings saved'
+      );
+    } catch (error) {
+      console.error('Failed to save DuoPlus settings:', error);
+      toast.error(
+        language === 'he' ? 'שגיאה בשמירת הגדרות DuoPlus' : language === 'ar' ? 'خطأ في حفظ إعدادات DuoPlus' : 'Failed to save DuoPlus settings'
+      );
+    } finally {
+      setSavingDuoplus(false);
+    }
   };
 
   const formatDate = (dateString?: string) => {
@@ -347,6 +376,135 @@ export default function Settings() {
                   </div>
                 </div>
               </div>
+            </CardContent>
+          </Card>
+
+          {/* DuoPlus Cloud Phone Integration */}
+          <Card className="overflow-hidden border-none shadow-md hover:shadow-lg transition-shadow duration-300">
+            <div className="bg-gradient-to-r from-indigo-500/10 to-violet-500/10 p-1 h-2 w-full"></div>
+            <CardHeader className="pb-4">
+              <div className="flex items-center gap-3">
+                <div className="p-2 bg-indigo-100 dark:bg-indigo-900/30 rounded-lg">
+                  <Smartphone className="h-5 w-5 text-indigo-600 dark:text-indigo-400" />
+                </div>
+                <div>
+                  <CardTitle className="text-xl">
+                    {language === 'he' ? 'טלפון ענן (DuoPlus)' : language === 'ar' ? 'هاتف سحابي (DuoPlus)' : 'Cloud Phone (DuoPlus)'}
+                  </CardTitle>
+                  <CardDescription>
+                    {language === 'he'
+                      ? 'התחבר ל-DuoPlus כדי לשלוח הודעות דרך מכשירי אנדרואיד ענניים'
+                      : language === 'ar'
+                      ? 'اتصل بـ DuoPlus لإرسال الرسائل عبر أجهزة أندرويد السحابية'
+                      : 'Connect to DuoPlus to send messages through cloud Android devices'
+                    }
+                  </CardDescription>
+                </div>
+              </div>
+            </CardHeader>
+            <CardContent className="space-y-6">
+              <div className="space-y-2.5">
+                <Label className="text-sm font-medium flex items-center gap-2 text-muted-foreground">
+                  <Key className="h-3.5 w-3.5" />
+                  {language === 'he' ? 'מפתח API של DuoPlus' : language === 'ar' ? 'مفتاح DuoPlus API' : 'DuoPlus API Key'}
+                </Label>
+                <Input
+                  type="password"
+                  value={duoplusSettings.apiKey}
+                  onChange={(e) => setDuoplusSettings({ ...duoplusSettings, apiKey: e.target.value })}
+                  placeholder={language === 'he' ? 'הדבק כאן את מפתח ה-API' : language === 'ar' ? 'الصق مفتاح API هنا' : 'Paste your API key here'}
+                  className="h-11 font-mono"
+                  autoComplete="off"
+                />
+                <p className="text-xs text-muted-foreground">
+                  {language === 'he'
+                    ? 'ניתן לקבל מפתח API בקונסולת DuoPlus תחת Automation → API'
+                    : language === 'ar'
+                    ? 'يمكنك الحصول على مفتاح API من لوحة تحكم DuoPlus ضمن Automation → API'
+                    : 'Get your API key from the DuoPlus console under Automation → API'
+                  }
+                </p>
+              </div>
+
+              <Separator className="bg-border/50" />
+
+              <div className="space-y-3">
+                <Label className="text-sm font-medium text-muted-foreground">
+                  {language === 'he' ? 'שיטת אישור שליחה' : language === 'ar' ? 'طريقة تأكيد الإرسال' : 'Send Confirmation Method'}
+                </Label>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <button
+                    type="button"
+                    onClick={() => setDuoplusSettings({ ...duoplusSettings, tapMode: 'auto' })}
+                    className={cn(
+                      "text-left p-3 rounded-xl border-2 transition-all",
+                      duoplusSettings.tapMode === 'auto'
+                        ? "border-primary bg-primary/5 ring-1 ring-primary shadow-sm"
+                        : "border-border/50 hover:border-primary/30 bg-background/50"
+                    )}
+                  >
+                    <p className="font-medium text-sm">{language === 'he' ? 'אוטומטי (מומלץ)' : language === 'ar' ? 'تلقائي (موصى به)' : 'Auto (Recommended)'}</p>
+                    <p className="text-xs text-muted-foreground mt-1">{language === 'he' ? 'מזהה את כפתור השליחה אוטומטית באמצעות UI Automator' : language === 'ar' ? 'يكتشف زر الإرسال تلقائيًا باستخدام UI Automator' : 'Auto-detects the send button using UI Automator'}</p>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDuoplusSettings({ ...duoplusSettings, tapMode: 'enter' })}
+                    className={cn(
+                      "text-left p-3 rounded-xl border-2 transition-all",
+                      duoplusSettings.tapMode === 'enter'
+                        ? "border-primary bg-primary/5 ring-1 ring-primary shadow-sm"
+                        : "border-border/50 hover:border-primary/30 bg-background/50"
+                    )}
+                  >
+                    <p className="font-medium text-sm">{language === 'he' ? 'מקש Enter' : language === 'ar' ? 'مفتاح Enter' : 'Enter Keypress'}</p>
+                    <p className="text-xs text-muted-foreground mt-1">{language === 'he' ? 'לרוב לא עובד באפליקציית WhatsApp' : language === 'ar' ? 'غالبًا لا يعمل في تطبيق واتساب' : 'Usually does not work in the WhatsApp app'}</p>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDuoplusSettings({ ...duoplusSettings, tapMode: 'coordinates' })}
+                    className={cn(
+                      "text-left p-3 rounded-xl border-2 transition-all",
+                      duoplusSettings.tapMode === 'coordinates'
+                        ? "border-primary bg-primary/5 ring-1 ring-primary shadow-sm"
+                        : "border-border/50 hover:border-primary/30 bg-background/50"
+                    )}
+                  >
+                    <p className="font-medium text-sm">{language === 'he' ? 'קואורדינטות מסך' : language === 'ar' ? 'إحداثيات الشاشة' : 'Screen Coordinates'}</p>
+                    <p className="text-xs text-muted-foreground mt-1">{language === 'he' ? 'לוחץ על מיקום קבוע במסך (כיול ידני)' : language === 'ar' ? 'ينقر على موضع ثابت على الشاشة (معايرة يدوية)' : 'Taps a fixed position on screen (manual calibration)'}</p>
+                  </button>
+                </div>
+
+                {duoplusSettings.tapMode === 'coordinates' && (
+                  <div className="grid grid-cols-2 gap-3 pt-2 animate-in fade-in slide-in-from-top-2">
+                    <div className="space-y-1.5">
+                      <Label className="text-xs text-muted-foreground">X</Label>
+                      <Input
+                        type="number"
+                        value={duoplusSettings.tapX ?? ''}
+                        onChange={(e) => setDuoplusSettings({ ...duoplusSettings, tapX: e.target.value ? +e.target.value : null })}
+                        className="h-10 font-mono text-center"
+                      />
+                    </div>
+                    <div className="space-y-1.5">
+                      <Label className="text-xs text-muted-foreground">Y</Label>
+                      <Input
+                        type="number"
+                        value={duoplusSettings.tapY ?? ''}
+                        onChange={(e) => setDuoplusSettings({ ...duoplusSettings, tapY: e.target.value ? +e.target.value : null })}
+                        className="h-10 font-mono text-center"
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <Button onClick={saveDuoplusSettings} disabled={savingDuoplus} className="w-full gap-2">
+                <Save className="h-4 w-4" />
+                {savingDuoplus
+                  ? (language === 'he' ? 'שומר...' : language === 'ar' ? 'جاري الحفظ...' : 'Saving...')
+                  : (language === 'he' ? 'שמור הגדרות' : language === 'ar' ? 'حفظ الإعدادات' : 'Save Settings')
+                }
+              </Button>
             </CardContent>
           </Card>
         </div>
